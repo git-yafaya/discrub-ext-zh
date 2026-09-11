@@ -627,7 +627,7 @@ describe('Search & Filters', () => {
         const entries = store?.getState()?.status?.entries ?? [];
         const messages = entries.map((e: any) => e.message);
         expect(
-          messages.some((m: string) => /Search Load All: connection failed, retrying in/.test(m)),
+          messages.some((m: string) => /Search Load All: Discord answered HTTP \d+, retrying in/.test(m)),
         ).to.be.true;
       });
     });

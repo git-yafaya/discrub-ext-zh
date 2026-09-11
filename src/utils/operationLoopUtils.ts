@@ -1,6 +1,7 @@
 import type { RootState } from '@/app/store';
 import { selectDiscrubPaused, selectDiscrubCancelled, selectRetryWaitSeconds } from '@features/app/appSlice';
 import { throttleImmuneSleep } from './workerTimers';
+import { t } from '@/i18n';
 
 /**
  * Error thrown when an operation is cancelled by the user.
@@ -156,6 +157,26 @@ export const ONLINE_NETWORK_RETRIES = 2;
  */
 export const isBrowserOnline = (): boolean =>
   typeof navigator === 'undefined' || navigator.onLine !== false;
+
+/**
+ * #266: what Discord answered, for a status line. A status is the HTTP
+ * code Discord sent back; no status means the request never got an
+ * answer (offline, or Discord's edge refused it).
+ */
+export const describeAnswer = (response: { status?: number } | null | undefined): string =>
+  response?.status !== undefined
+    ? t('status.msg.answerHttp', { status: response.status })
+    : t('status.msg.answerNone');
+
+/**
+ * #266: the failure text for a Load All that Discord refused outright
+ * (a 4xx the retry helper does not retry, or a refused request while
+ * online). `prefix` is the locale key stem, e.g. `fetchAllFailed`.
+ */
+export const describeFailure = (response: { status?: number } | null | undefined, prefix: string): string =>
+  response?.status !== undefined
+    ? t(`status.msg.${prefix}Http`, { status: response.status })
+    : t(`status.msg.${prefix}NoResponse`);
 
 /** Retries in a transient-retry run (the wait doubles this many times, less one). */
 export const TRANSIENT_RETRIES = 5;

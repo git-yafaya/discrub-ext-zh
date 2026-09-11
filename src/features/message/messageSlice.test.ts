@@ -5117,6 +5117,40 @@ describe('messageSlice', () => {
         expect(testStore.getState().app.discrubPaused).toBe(false);
       });
 
+      it('#266: the thread Load All retry line says what Discord answered', async () => {
+        setOnline(false);
+        const batch = createMockMessages(3);
+        const fetchSpy = vi.fn()
+          .mockResolvedValueOnce({ success: false, status: 503 })
+          .mockResolvedValueOnce({ success: false, status: undefined })
+          .mockResolvedValueOnce({ success: true, data: batch });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchMessageData: fetchSpy } as any);
+        vi.mocked(addStatusEntry).mockClear();
+
+        const testStore = await createStoreWithApp(threadTabState());
+        await testStore.dispatch(fetchAllThreadMessages({ threadId: 'thread-100', token: 'token' }));
+
+        const lines = vi.mocked(addStatusEntry).mock.calls
+          .map(([p]) => p.message)
+          .filter((m) => /retrying in/.test(m));
+        expect(lines).toEqual([
+          'Load All: Discord answered HTTP 503, retrying in 1s (attempt 1/5)',
+          'Load All: Discord did not answer, retrying in 1s (attempt 2/5)',
+        ]);
+      });
+
+      it('#266: a refused thread Load All rejects with the HTTP status', async () => {
+        const fetchSpy = vi.fn().mockResolvedValue({ success: false, status: 403 });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchMessageData: fetchSpy } as any);
+
+        const testStore = await createStoreWithApp(threadTabState());
+        const result = await testStore.dispatch(fetchAllThreadMessages({ threadId: 'thread-100', token: 'token' }));
+
+        expect(result.type).toBe('message/fetchAllThreadMessages/rejected');
+        expect(result.payload).toBe('Failed to fetch all thread messages (HTTP 403)');
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+      });
+
       it('#245: pauses the thread Load All after retries are exhausted, preserves partial progress', async () => {
         setOnline(false);
         const { waitWhilePaused, checkCancelled } = await import('@/utils/operationLoopUtils');
@@ -6805,6 +6839,70 @@ describe('messageSlice', () => {
         expect(retryEntries).toHaveLength(2);
       });
 
+      it('#266: the retry lines say what Discord answered', async () => {
+        setOnline(false);
+        const batch = createMockMessages(10);
+        vi.mocked(discordService.getDiscordService).mockReturnValue({
+          fetchMessageData: vi
+            .fn()
+            .mockResolvedValueOnce({ success: false, status: undefined })
+            .mockResolvedValueOnce({ success: false, status: 503 })
+            .mockResolvedValueOnce({ success: true, data: batch }),
+        } as any);
+        vi.mocked(addStatusEntry).mockClear();
+
+        const { store } = await buildStore();
+        await store.dispatch(fetchAllMessages({ channelId: 'ch-1', token: 'token' }));
+
+        const lines = vi.mocked(addStatusEntry).mock.calls
+          .map(([p]) => p.message)
+          .filter((m) => /retrying in/.test(m));
+        expect(lines).toEqual([
+          'Load All: Discord did not answer, retrying in 1s (attempt 1/5)',
+          'Load All: Discord answered HTTP 503, retrying in 1s (attempt 2/5)',
+        ]);
+      });
+
+      it('#266: the paused line names the last answer', async () => {
+        setOnline(false);
+        const { waitWhilePaused, checkCancelled } = await import('@/utils/operationLoopUtils');
+        vi.mocked(checkCancelled).mockImplementation((getState: any) => getState().app.discrubCancelled);
+        vi.mocked(waitWhilePaused).mockImplementation(async (getState: any) => {
+          while (getState().app.discrubPaused) {
+            await new Promise((r) => setTimeout(r, 10));
+            if (getState().app.discrubCancelled) return;
+          }
+        });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({
+          fetchMessageData: vi.fn().mockResolvedValue({ success: false, status: 502 }),
+        } as any);
+        vi.mocked(addStatusEntry).mockClear();
+
+        const { store, setDiscrubCancelled } = await buildStore();
+        const pending = store.dispatch(fetchAllMessages({ channelId: 'ch-1', token: 'token' }));
+        for (let i = 0; i < 400 && !store.getState().app.discrubPaused; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        expect(store.getState().app.discrubPaused).toBe(true);
+        const paused = vi.mocked(addStatusEntry).mock.calls.map(([p]) => p.message).find((m) => /paused after/.test(m));
+        expect(paused).toBe('Load All: paused after 5 failed retries (Discord answered HTTP 502). Check your connection, then click Resume to continue from 0 messages fetched.');
+        store.dispatch(setDiscrubCancelled(true));
+        await pending;
+      }, 20000);
+
+      it('#266: a refused Load All rejects with the HTTP status', async () => {
+        vi.mocked(discordService.getDiscordService).mockReturnValue({
+          fetchMessageData: vi.fn().mockResolvedValue({ success: false, status: 403 }),
+        } as any);
+
+        const { store } = await buildStore();
+        const result = await store.dispatch(fetchAllMessages({ channelId: 'ch-1', token: 'token' }));
+
+        expect(result.type).toBe('message/fetchAllMessages/rejected');
+        expect(result.payload).toBe('Failed to fetch all messages (HTTP 403)');
+        expect(store.getState().message.error).toBe('Failed to fetch all messages (HTTP 403)');
+      });
+
       it('online: a status-less failure stops after two quick retries instead of pausing (GH #14)', async () => {
         setOnline(true);
         const batch = createMockMessages(100);
@@ -6929,7 +7027,7 @@ describe('messageSlice', () => {
         expect(store.getState().message.messages).toHaveLength(25);
 
         const retryEntries = vi.mocked(addStatusEntry).mock.calls.filter(
-          ([p]) => p.level === 'warning' && /Search Load All: connection failed, retrying/.test(p.message),
+          ([p]) => p.level === 'warning' && /Search Load All: Discord answered HTTP 502, retrying/.test(p.message),
         );
         expect(retryEntries).toHaveLength(1);
       });
@@ -6957,10 +7055,10 @@ describe('messageSlice', () => {
         expect(result.type).toBe('message/loadAllSearchResults/fulfilled');
         const retryMessages = vi.mocked(addStatusEntry).mock.calls
           .map(([p]) => p.message)
-          .filter((m) => /Search Load All: connection failed, retrying/.test(m));
+          .filter((m) => /Search Load All: Discord answered HTTP 502, retrying/.test(m));
         expect(retryMessages).toEqual([
-          'Search Load All: connection failed, retrying in 2s (attempt 1/5)',
-          'Search Load All: connection failed, retrying in 4s (attempt 2/5)',
+          'Search Load All: Discord answered HTTP 502, retrying in 2s (attempt 1/5)',
+          'Search Load All: Discord answered HTTP 502, retrying in 4s (attempt 2/5)',
         ]);
       });
 

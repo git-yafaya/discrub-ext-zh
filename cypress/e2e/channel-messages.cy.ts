@@ -210,7 +210,7 @@ describe('Channel Messages', () => {
       const entries = store?.getState()?.status?.entries ?? [];
       const messages = entries.map((e: any) => e.message);
       expect(
-        messages.some((m: string) => /Load All: connection failed, retrying in/.test(m)),
+        messages.some((m: string) => /Load All: Discord answered HTTP 503, retrying in/.test(m)),
       ).to.be.true;
     });
   });
@@ -264,7 +264,7 @@ describe('Channel Messages', () => {
     cy.window().then((win) => {
       const entries = (win as any).__store__.getState().status.entries ?? [];
       const messages = entries.map((e: any) => e.message);
-      expect(messages.some((m: string) => /Load All: connection failed, retrying in 3s \(attempt 1\/5\)/.test(m))).to.be.true;
+      expect(messages.some((m: string) => /Load All: Discord answered HTTP 503, retrying in 3s \(attempt 1\/5\)/.test(m))).to.be.true;
     });
   });
 

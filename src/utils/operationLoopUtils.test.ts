@@ -6,7 +6,7 @@ import {
   withTransientRetry,
   isTransientApiFailure,
   isBrowserOnline,
-  ONLINE_NETWORK_RETRIES, transientRetryDelayMs } from './operationLoopUtils';
+  ONLINE_NETWORK_RETRIES, transientRetryDelayMs, describeAnswer, describeFailure } from './operationLoopUtils';
 import type { RootState } from '@/app/store';
 import { DiscrubSetting } from 'discrub-core/discrub-enum';
 import { initialAppState } from '@features/app/appTypes';
@@ -288,6 +288,22 @@ describe('withTransientRetry', () => {
     // And the attempt counters track in step (1-indexed by design).
     const attempts = onRetry.mock.calls.map((c) => c[0]);
     expect(attempts).toEqual([1, 2, 3, 4]);
+  });
+});
+
+describe('describeAnswer / describeFailure (#266)', () => {
+  it('names the HTTP status when Discord answered', () => {
+    expect(describeAnswer({ status: 503 })).toBe('Discord answered HTTP 503');
+    expect(describeFailure({ status: 403 }, 'fetchAllFailed')).toBe('Failed to fetch all messages (HTTP 403)');
+    expect(describeFailure({ status: 404 }, 'fetchAllThreadFailed')).toBe('Failed to fetch all thread messages (HTTP 404)');
+  });
+
+  it('says Discord did not answer when there is no status', () => {
+    expect(describeAnswer({})).toBe('Discord did not answer');
+    expect(describeAnswer(undefined)).toBe('Discord did not answer');
+    expect(describeFailure({ success: false } as any, 'fetchAllFailed')).toBe(
+      'Failed to fetch all messages. Discord did not answer, check your connection and try again.',
+    );
   });
 });
 

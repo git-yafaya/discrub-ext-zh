@@ -13,7 +13,7 @@ import { userEnrichmentService } from '@services/userEnrichmentService';
 import { reactionEnrichmentService } from '@services/reactionEnrichmentService';
 import { replyEnrichmentService } from '@services/replyEnrichmentService';
 import { mergeCachedUserMap, addFailedUserId, saveCacheToLocalStorage } from '@features/cache/cacheSlice';
-import { waitWhilePaused, checkCancelled, cancellableDelay, withTransientRetry, isTransientApiFailure, transientRetryDelayMs, retryBaseDelayMs } from '@/utils/operationLoopUtils';
+import { waitWhilePaused, checkCancelled, cancellableDelay, withTransientRetry, isTransientApiFailure, transientRetryDelayMs, retryBaseDelayMs, describeAnswer, describeFailure } from '@/utils/operationLoopUtils';
 import { addStatusEntry, showOperationTip, showToast } from '@features/status/statusSlice';
 import { getEmojiKey } from '@/utils/emojiUtils';
 import { applyRefineCriteria, criteriaIsActive, type RefineCriteria } from './messageFiltering';
@@ -1646,6 +1646,7 @@ export const loadAllSearchResults = createAsyncThunk(
 
     try {
       let transientRetries = 0;
+      let lastAnswer = '';
 
       // Outer restart loop. The lib iterator handles offset pagination, the
       // 5000-match cap-shift, total_results reshuffles, 202 index-lag retry,
@@ -1693,6 +1694,7 @@ export const loadAllSearchResults = createAsyncThunk(
             const status = (err as { status?: number } | null)?.status;
             if (isTransientApiFailure({ success: false, status })) {
               transientRetries += 1;
+              lastAnswer = describeAnswer({ status });
               if (transientRetries <= 5) {
                 // #265: same curve as withTransientRetry, from the Retry wait setting.
                 const delayMs = transientRetryDelayMs(
@@ -1701,7 +1703,7 @@ export const loadAllSearchResults = createAsyncThunk(
                 );
                 dispatch(addStatusEntry({
                   level: 'warning',
-                  message: t('status.msg.searchLoadAllRetry', { seconds: Math.round(delayMs / 1000), attempt: transientRetries }),
+                  message: t('status.msg.searchLoadAllRetry', { answer: lastAnswer, seconds: Math.round(delayMs / 1000), attempt: transientRetries }),
                 }));
                 const cancelled = await cancellableDelay(
                   delayMs,
@@ -1716,7 +1718,7 @@ export const loadAllSearchResults = createAsyncThunk(
               dispatch(setDiscrubPaused(true));
               dispatch(addStatusEntry({
                 level: 'warning',
-                message: t('status.msg.searchLoadAllPaused', { count: aggregated.length }),
+                message: t('status.msg.searchLoadAllPaused', { answer: lastAnswer, count: aggregated.length }),
               }));
               await waitWhilePaused(getState as () => RootState);
               if (checkCancelled(getState as () => RootState)) {
@@ -1922,10 +1924,10 @@ export const fetchAllMessages = createAsyncThunk(
           {
             getState: getState as () => RootState,
             signal,
-            onRetry: (attempt, delayMs) => {
+            onRetry: (attempt, delayMs, last) => {
               dispatch(addStatusEntry({
                 level: 'warning',
-                message: t('status.msg.loadAllRetry', { seconds: Math.round(delayMs / 1000), attempt }),
+                message: t('status.msg.loadAllRetry', { answer: describeAnswer(last), seconds: Math.round(delayMs / 1000), attempt }),
               }));
             },
           },
@@ -1936,11 +1938,11 @@ export const fetchAllMessages = createAsyncThunk(
             dispatch(setDiscrubPaused(true));
             dispatch(addStatusEntry({
               level: 'warning',
-              message: t('status.msg.loadAllPaused', { count: allMessages.length }),
+              message: t('status.msg.loadAllPaused', { answer: describeAnswer(response), count: allMessages.length }),
             }));
             continue;
           }
-          return rejectWithValue('Failed to fetch all messages');
+          return rejectWithValue(describeFailure(response, 'fetchAllFailed'));
         }
 
         const messages = response.data as Message[];
@@ -2352,10 +2354,10 @@ export const fetchAllThreadMessages = createAsyncThunk(
           {
             getState: getState as () => RootState,
             signal,
-            onRetry: (attempt, delayMs) => {
+            onRetry: (attempt, delayMs, last) => {
               dispatch(addStatusEntry({
                 level: 'warning',
-                message: t('status.msg.loadAllRetry', { seconds: Math.round(delayMs / 1000), attempt }),
+                message: t('status.msg.loadAllRetry', { answer: describeAnswer(last), seconds: Math.round(delayMs / 1000), attempt }),
               }));
             },
           },
@@ -2366,7 +2368,7 @@ export const fetchAllThreadMessages = createAsyncThunk(
             dispatch(setDiscrubPaused(true));
             dispatch(addStatusEntry({
               level: 'warning',
-              message: t('status.msg.loadAllPaused', { count: allMessages.length }),
+              message: t('status.msg.loadAllPaused', { answer: describeAnswer(response), count: allMessages.length }),
             }));
             continue;
           }
@@ -2374,7 +2376,7 @@ export const fetchAllThreadMessages = createAsyncThunk(
             threadId,
             pagination: { isLoadingAll: false, loadAllProgress: null },
           }));
-          return rejectWithValue('Failed to fetch all thread messages');
+          return rejectWithValue(describeFailure(response, 'fetchAllThreadFailed'));
         }
 
         const messages = response.data as Message[];
