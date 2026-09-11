@@ -35,9 +35,11 @@ describe('Error Logging & Status Log', () => {
       cy.selectServer('Cypress Test Server');
       cy.selectChannel('general');
 
+      // #262: a 5xx is retried with backoff before it fails, so refuse
+      // the search with a 403 (not transient) to get the error entry at once.
       cy.intercept('GET', `${API}/guilds/*/messages/search*`, {
-        statusCode: 500,
-        body: { message: 'Internal Server Error' },
+        statusCode: 403,
+        body: { message: 'Missing Access', code: 50001 },
       }).as('failedSearch');
 
       cy.contains('button', 'Filters').click();
@@ -46,7 +48,7 @@ describe('Error Logging & Status Log', () => {
       cy.wait('@failedSearch');
 
       cy.contains('STATUS LOG').click();
-      cy.contains('Failed to search messages').should('be.visible');
+      cy.contains('Failed to search messages (HTTP 403)').should('be.visible');
     });
   });
 

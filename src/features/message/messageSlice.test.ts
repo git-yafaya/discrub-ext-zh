@@ -1368,6 +1368,85 @@ describe('messageSlice', () => {
       expect(warned).toBe(true);
     });
 
+    // #262: the initial channel search had no 202 wait or transient
+    // retry, and its failure line never carried the HTTP status.
+    const searchStore = async () => {
+      const { configureStore } = await import('@reduxjs/toolkit');
+      const appReducer = (await import('@features/app/appSlice')).default;
+      const { defaultSettings } = await import('@features/app/appSlice');
+      return configureStore({
+        reducer: { message: messageReducer, app: appReducer },
+        preloadedState: {
+          app: {
+            discrubPaused: false,
+            discrubCancelled: false,
+            isMinimized: false,
+            focusedView: false,
+            kofiOverlayOpen: false,
+            sidebarView: 'server' as const,
+            task: { status: 'idle' as const, message: '' },
+            settings: defaultSettings,
+            previewThemeId: null,
+          },
+          message: initialMessageState,
+        },
+      });
+    };
+
+    it('waits out a 202 on the initial search and shows the page that follows (#262)', async () => {
+      const fetchSearchMessageData = vi.fn()
+        .mockResolvedValueOnce({ success: true, status: 202 })
+        .mockResolvedValueOnce({
+          success: true,
+          status: 200,
+          data: { messages: [createMockMessages(2)], total_results: 2 },
+        });
+      vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+      vi.mocked(addStatusEntry).mockClear();
+
+      const testStore = await searchStore();
+      const result = await testStore.dispatch(
+        searchMessages({ channelId: 'channel-1', token: 'token', searchCriteria: {} as any })
+      );
+
+      expect(result.type).toBe('message/searchMessages/fulfilled');
+      expect(fetchSearchMessageData).toHaveBeenCalledTimes(2);
+      expect(testStore.getState().message.messages).toHaveLength(2);
+      const waits = vi.mocked(addStatusEntry).mock.calls.filter(
+        ([entry]: any[]) => entry?.level === 'warning' && /still indexing, retrying in 1s \(attempt 1\/5\)/.test(entry.message)
+      );
+      expect(waits).toHaveLength(1);
+    }, 10000);
+
+    it('rejects with the HTTP status when Discord refuses the initial search (#262)', async () => {
+      const fetchSearchMessageData = vi.fn().mockResolvedValue({ success: false, status: 403 });
+      vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+      const testStore = await searchStore();
+      const result = await testStore.dispatch(
+        searchMessages({ channelId: 'channel-1', token: 'token', searchCriteria: {} as any })
+      );
+
+      expect(result.type).toBe('message/searchMessages/rejected');
+      expect(result.payload).toBe('Failed to search messages (HTTP 403)');
+      expect(testStore.getState().message.error).toBe('Failed to search messages (HTTP 403)');
+      expect(fetchSearchMessageData).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after five 202 answers and says Discord is still indexing (#262)', async () => {
+      const fetchSearchMessageData = vi.fn().mockResolvedValue({ success: true, status: 202 });
+      vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+      const testStore = await searchStore();
+      const result = await testStore.dispatch(
+        searchMessages({ channelId: 'channel-1', token: 'token', searchCriteria: {} as any })
+      );
+
+      expect(result.type).toBe('message/searchMessages/rejected');
+      expect(result.payload).toMatch(/^Failed to search messages\. Discord is still indexing/);
+      expect(fetchSearchMessageData).toHaveBeenCalledTimes(6);
+    }, 30000);
+
     it('should search messages with criteria', async () => {
       // searchMessages requires app state for delay settings
       const { configureStore } = await import('@reduxjs/toolkit');
@@ -4285,6 +4364,111 @@ describe('messageSlice', () => {
         expect(successCalls).toHaveLength(1);
         expect(successCalls[0][0].message).toBe('Search complete: 4 results found');
       });
+
+      // #262: thread search used to treat a 202 (Discord still indexing)
+      // as a failure and never said what Discord answered.
+      const threadTabState = () => ({
+        ...initialMessageState,
+        activeTab: 'thread-100',
+        threadTabs: {
+          'thread-100': {
+            threadId: 'thread-100',
+            threadName: 'Thread',
+            messages: [],
+            filteredMessages: [],
+            selectedMessages: [],
+            searchCriteria: null, refineCriteria: null,
+            order: initialMessageState.order,
+            isLoading: false,
+            error: null,
+            pagination: { ...initialMessageState.pagination },
+          },
+        },
+      });
+
+      it('waits out a 202 and fills the tab from the page that follows (#262)', async () => {
+        const searchResults = createMockMessages(3);
+        const fetchSearchMessageData = vi.fn()
+          .mockResolvedValueOnce({ success: true, status: 202 })
+          .mockResolvedValueOnce({
+            success: true,
+            status: 200,
+            data: { messages: [searchResults], total_results: 3 },
+          });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+        vi.mocked(addStatusEntry).mockClear();
+
+        const testStore = await createStoreWithApp(threadTabState());
+        const result = await testStore.dispatch(
+          searchThreadMessages({ threadId: 'thread-100', token: 'token', searchCriteria: {} as any })
+        );
+
+        expect(result.type).toBe('message/searchThreadMessages/fulfilled');
+        expect(fetchSearchMessageData).toHaveBeenCalledTimes(2);
+        expect(testStore.getState().message.threadTabs['thread-100'].messages).toHaveLength(3);
+        const waits = vi.mocked(addStatusEntry).mock.calls.filter(
+          ([entry]) => entry.level === 'warning' && /still indexing, retrying in 1s \(attempt 1\/5\)/.test(entry.message)
+        );
+        expect(waits).toHaveLength(1);
+      }, 10000);
+
+      it('rejects with the HTTP status when Discord refuses the thread search (#262)', async () => {
+        const fetchSearchMessageData = vi.fn().mockResolvedValue({ success: false, status: 403 });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+        const testStore = await createStoreWithApp(threadTabState());
+        const result = await testStore.dispatch(
+          searchThreadMessages({ threadId: 'thread-100', token: 'token', searchCriteria: {} as any })
+        );
+
+        expect(result.type).toBe('message/searchThreadMessages/rejected');
+        expect(result.payload).toBe('Failed to search thread messages (HTTP 403)');
+        expect(fetchSearchMessageData).toHaveBeenCalledTimes(1);
+        const tab = testStore.getState().message.threadTabs['thread-100'];
+        expect(tab.isLoading).toBe(false);
+        expect(tab.pagination.loadAllProgress).toBeNull();
+      });
+
+      it('retries a transient 503 on the thread search and completes (#262)', async () => {
+        const searchResults = createMockMessages(1);
+        const fetchSearchMessageData = vi.fn()
+          .mockResolvedValueOnce({ success: false, status: 503 })
+          .mockResolvedValueOnce({
+            success: true,
+            status: 200,
+            data: { messages: [searchResults], total_results: 1 },
+          });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+        vi.mocked(addStatusEntry).mockClear();
+
+        const testStore = await createStoreWithApp(threadTabState());
+        const result = await testStore.dispatch(
+          searchThreadMessages({ threadId: 'thread-100', token: 'token', searchCriteria: {} as any })
+        );
+
+        expect(result.type).toBe('message/searchThreadMessages/fulfilled');
+        expect(fetchSearchMessageData).toHaveBeenCalledTimes(2);
+        const retries = vi.mocked(addStatusEntry).mock.calls.filter(
+          ([entry]) => entry.level === 'warning' && /^Search: connection failed, retrying in 1s \(attempt 1\/5\)/.test(entry.message)
+        );
+        expect(retries).toHaveLength(1);
+      }, 10000);
+
+      it('says when the request never got an answer, after the online quick retries (#262)', async () => {
+        // No status = the fetch threw. Online, that gets ONLINE_NETWORK_RETRIES
+        // quick retries (1s, 2s) and then counts as permanent.
+        const fetchSearchMessageData = vi.fn().mockResolvedValue({ success: false });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+        const testStore = await createStoreWithApp(threadTabState());
+        const result = await testStore.dispatch(
+          searchThreadMessages({ threadId: 'thread-100', token: 'token', searchCriteria: {} as any })
+        );
+
+        expect(result.type).toBe('message/searchThreadMessages/rejected');
+        expect(result.payload).toMatch(/^Failed to search thread messages\. Discord did not answer/);
+        expect(fetchSearchMessageData).toHaveBeenCalledTimes(3);
+      }, 15000);
     });
   });
 

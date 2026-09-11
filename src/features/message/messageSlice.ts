@@ -21,6 +21,30 @@ import { selectCurrentUser } from '@features/user/userSlice';
 import { selectAuthToken } from '@features/auth/authSlice';
 import { countActiveFilters } from 'discrub-core/filtering';
 import { t } from '@/i18n';
+import { fetchSearchPageWithRetry, describeSearchFailure } from './searchPageRetry';
+
+/**
+ * Status-log hooks for a single-page search request (#262): one warning
+ * per 202 wait and per transient retry, worded like Load All's.
+ */
+const searchPageRetryHooks = (
+  dispatch: (action: ReturnType<typeof addStatusEntry>) => unknown,
+  getState: () => RootState,
+) => ({
+  getState,
+  onIndexingWait: (attempt: number, delayMs: number) => {
+    dispatch(addStatusEntry({
+      level: 'warning',
+      message: t('status.msg.searchIndexingWait', { seconds: Math.round(delayMs / 1000), attempt }),
+    }));
+  },
+  onRetry: (attempt: number, delayMs: number) => {
+    dispatch(addStatusEntry({
+      level: 'warning',
+      message: t('status.msg.searchRetry', { seconds: Math.round(delayMs / 1000), attempt }),
+    }));
+  },
+});
 
 /**
  * Append the HTTP status discrub-core already returns (`DiscordApiResponse
@@ -1268,18 +1292,24 @@ export const searchMessages = createAsyncThunk(
       dispatch(addStatusEntry({ level: 'info', message: t('status.msg.searchStarting') }));
       const discordService = getDiscordService();
 
-      const response = await discordService.fetchSearchMessageData(
-        token,
-        0,
-        channelId || null,
-        guildId || null,
-        searchCriteria
+      // #262: wait out a 202 (Discord still indexing) and retry transient
+      // failures, then say what Discord answered when it still fails.
+      const response = await fetchSearchPageWithRetry(
+        () => discordService.fetchSearchMessageData(
+          token,
+          0,
+          channelId || null,
+          guildId || null,
+          searchCriteria
+        ),
+        searchPageRetryHooks(dispatch, getState as () => RootState),
       );
 
       if (!response.success || !response.data) {
-        return rejectWithValue(
-          'Failed to search messages. Check your connection and try again.'
-        );
+        if (checkCancelled(getState as () => RootState)) {
+          return rejectWithValue('Search cancelled');
+        }
+        return rejectWithValue(describeSearchFailure(response, 'channel'));
       }
 
       const rawMessages = response.data.messages
@@ -2501,13 +2531,18 @@ export const searchThreadMessages = createAsyncThunk(
             break;
           }
 
-          // Threads are channels — search by channelId
-          const response = await discordService.fetchSearchMessageData(
-            token,
-            offset,
-            threadId,
-            null,
-            currentCriteria
+          // Threads are channels — search by channelId. #262: the same
+          // 202 wait + transient retry as the initial channel search, and
+          // the failure line carries what Discord answered.
+          const response = await fetchSearchPageWithRetry(
+            () => discordService.fetchSearchMessageData(
+              token,
+              offset,
+              threadId,
+              null,
+              currentCriteria
+            ),
+            { ...searchPageRetryHooks(dispatch, getState as () => RootState), signal },
           );
 
           if (!response.success || !response.data) {
@@ -2516,13 +2551,23 @@ export const searchThreadMessages = createAsyncThunk(
               threadId,
               pagination: { loadAllProgress: null },
             }));
-            return rejectWithValue('Failed to search thread messages');
+            if (signal.aborted || checkCancelled(getState as () => RootState)) {
+              return rejectWithValue('Search cancelled');
+            }
+            return rejectWithValue(describeSearchFailure(response, 'thread'));
           }
 
           const searchResult = response.data;
           const rawMessages = searchResult.messages
             ? searchResult.messages.flatMap((group) => group)
             : [];
+
+          // #216 parity with the channel search: an empty first page while
+          // Discord is still building the index is not "no matches".
+          if (offset === 0 && allMessages.length === 0
+            && searchResult.doing_deep_historical_index && rawMessages.length === 0) {
+            dispatch(addStatusEntry({ level: 'warning', message: t('status.msg.stillIndexing') }));
+          }
 
           if (rawMessages.length === 0) {
             shouldContinue = false;
@@ -2648,7 +2693,7 @@ export const searchThreadMessages = createAsyncThunk(
         pagination: { loadAllProgress: null },
       }));
       return rejectWithValue(
-        error instanceof Error ? error.message : 'Failed to search thread messages'
+        error instanceof Error ? error.message : t('status.msg.searchThreadFailed')
       );
     }
   }

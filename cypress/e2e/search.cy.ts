@@ -191,7 +191,56 @@ describe('Search & Filters', () => {
       searchViaModal('test');
       cy.wait('@guildSearch');
 
-      cy.contains('Failed to search messages').should('be.visible');
+      // #262: a 500 is transient, so the search retries it five times
+      // (1s, 2s, 4s, 8s, 16s backoff) before giving up with the status.
+      cy.contains('Failed to search messages (HTTP 500)', { timeout: 45000 }).should('be.visible');
+    });
+
+    // #262: a 403 is not transient; the failure names the status at once.
+    it('names the HTTP status when Discord refuses the search', () => {
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, {
+        statusCode: 403,
+        body: { message: 'Missing Access', code: 50001 },
+      }).as('guildSearch');
+
+      searchViaModal('test');
+      cy.wait('@guildSearch');
+
+      cy.contains('Failed to search messages (HTTP 403)').should('be.visible');
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        const messages = (store?.getState()?.status?.entries ?? []).map((e: any) => e.message);
+        expect(messages).to.include('message/searchMessages: Failed to search messages (HTTP 403)');
+      });
+    });
+
+    // #262: a 202 means Discord is still building the index; the search
+    // waits it out and shows the page that follows instead of failing.
+    it('waits out a 202 (still indexing) and shows the results that follow', () => {
+      let call = 0;
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, (req) => {
+        call += 1;
+        if (call === 1) {
+          req.reply({ statusCode: 202, body: { retry_after: 1 } });
+        } else {
+          req.reply({ fixture: 'search-results.json' });
+        }
+      }).as('guildSearch');
+
+      searchViaModal('project');
+      cy.wait('@guildSearch');
+      cy.wait('@guildSearch');
+
+      cy.contains('Failed to search messages').should('not.exist');
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        const messages = (store?.getState()?.status?.entries ?? []).map((e: any) => e.message);
+        expect(
+          messages.some((m: string) => /^Search: Discord is still indexing, retrying in 1s \(attempt 1\/5\)/.test(m)),
+        ).to.be.true;
+        expect(store.getState().message.pagination.mode).to.equal('search');
+        expect(store.getState().message.messages.length).to.be.greaterThan(0);
+      });
     });
 
     it('triggers search on Enter key press in content field', () => {

@@ -161,6 +161,69 @@ describe('Thread Tabs — Comprehensive', () => {
       cy.contains('Thread reply from Alice').should('be.visible');
     });
 
+    // #262: a 202 means Discord is still building the thread's search
+    // index. The thread search waits it out and shows the page that follows.
+    it('waits out a 202 (still indexing) on the thread search and shows the results', () => {
+      loadThread();
+
+      cy.fixture('thread-search-results.json').then((results) => {
+        let call = 0;
+        cy.intercept('GET', `**/api/v10/channels/${THREAD_ID}/messages/search*`, (req) => {
+          call += 1;
+          if (call === 1) {
+            req.reply({ statusCode: 202, body: { retry_after: 1 } });
+          } else {
+            req.reply({ statusCode: 200, body: results });
+          }
+        }).as('searchThread');
+      });
+
+      cy.contains('button', 'Filters').click();
+      cy.get('[role="dialog"]').find('input[placeholder="Search message content..."]').type('Alice');
+      cy.get('[role="dialog"]').find('button[class*="contained"]').contains('Search').click();
+      cy.wait('@searchThread');
+      cy.wait('@searchThread');
+
+      cy.contains('Thread reply from Alice', { timeout: 10000 }).should('be.visible');
+
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        const messages = (store?.getState()?.status?.entries ?? []).map((e: any) => e.message);
+        expect(
+          messages.some((m: string) => /^Search: Discord is still indexing, retrying in 1s \(attempt 1\/5\)/.test(m)),
+        ).to.be.true;
+        expect(messages.some((m: string) => /searchThreadMessages: Failed/.test(m))).to.be.false;
+      });
+    });
+
+    // #262: when Discord refuses the thread search, the status log says
+    // which HTTP status came back instead of a bare "Failed to search".
+    it('logs the HTTP status when Discord refuses the thread search', () => {
+      loadThread();
+
+      cy.intercept('GET', `**/api/v10/channels/${THREAD_ID}/messages/search*`, {
+        statusCode: 403,
+        body: { message: 'Missing Access', code: 50001 },
+      }).as('searchThread');
+
+      cy.contains('button', 'Filters').click();
+      cy.get('[role="dialog"]').find('input[placeholder="Search message content..."]').type('Alice');
+      cy.get('[role="dialog"]').find('button[class*="contained"]').contains('Search').click();
+      cy.wait('@searchThread');
+
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        const entries = store?.getState()?.status?.entries ?? [];
+        const failure = entries.find((e: any) => /message\/searchThreadMessages: /.test(e.message));
+        expect(failure, 'thread search failure entry').to.exist;
+        expect(failure.level).to.equal('error');
+        expect(failure.message).to.equal('message/searchThreadMessages: Failed to search thread messages (HTTP 403)');
+        // The tab is usable again: no spinner, no stuck progress.
+        expect(store.getState().message.threadTabs[THREAD_ID].isLoading).to.be.false;
+        expect(store.getState().message.threadTabs[THREAD_ID].pagination.loadAllProgress).to.be.null;
+      });
+    });
+
     it('should search main channel (guild endpoint) when on main tab', () => {
       loadThread();
       switchToMain();
