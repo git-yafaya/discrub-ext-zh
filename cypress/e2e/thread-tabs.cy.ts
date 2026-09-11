@@ -196,6 +196,62 @@ describe('Thread Tabs — Comprehensive', () => {
       });
     });
 
+    // #264: Discord's search returns spuriously short pages mid-stream. The
+    // thread walk used to stop on any page under 25 and step the offset by
+    // a fixed 25, ending a By User search at the first page and skipping
+    // results. It now pages until total_results and steps by what came back.
+    it('keeps paging the thread search after a short page (#264)', () => {
+      loadThread();
+      // Pass 1 reaction enrichment (#163) would fetch an around-window per
+      // search hit (30 here) before the thunk commits; not what this test
+      // checks, and it would push the second page past cy.wait's timeout.
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        store.dispatch({
+          type: 'app/updateSetting/fulfilled',
+          payload: { ...store.getState().app.settings, reactionsEnabled: 'false' },
+        });
+      });
+
+      const page = (offset: number, count: number) => ({
+        messages: Array.from({ length: count }, (_, i) => [{
+          id: `700000000000000${String(offset + i).padStart(3, '0')}`,
+          channel_id: THREAD_ID,
+          author: { id: '222333444555666777', username: 'alice_dev', discriminator: '0', avatar: 'alice_avatar', global_name: 'Alice' },
+          content: `Thread search hit ${offset + i + 1}`,
+          timestamp: `2026-02-01T12:${String((offset + i) % 60).padStart(2, '0')}:00.000Z`,
+          edited_timestamp: null, tts: false, mention_everyone: false, mentions: [], attachments: [], embeds: [], reactions: [], pinned: false, type: 0,
+        }]),
+        total_results: 30,
+        threads: [],
+      });
+
+      const offsets: string[] = [];
+      cy.intercept('GET', `**/api/v10/channels/${THREAD_ID}/messages/search*`, (req) => {
+        const offset = new URL(req.url).searchParams.get('offset') ?? '0';
+        offsets.push(offset);
+        req.reply({ statusCode: 200, body: offset === '0' ? page(0, 20) : page(20, 10) });
+      }).as('searchThread');
+
+      cy.contains('button', 'Filters').click();
+      cy.get('[role="dialog"]').find('input[placeholder="Search message content..."]').type('hit');
+      cy.get('[role="dialog"]').find('button[class*="contained"]').contains('Search').click();
+      cy.wait('@searchThread');
+      // The walk pauses for the search delay between pages.
+      cy.wait('@searchThread', { timeout: 15000 });
+
+      // The thunk sorts and commits after the last page; retry until it has.
+      cy.window().its('__store__').should((store: any) => {
+        expect(store.getState().message.threadTabs[THREAD_ID].messages.length).to.equal(30);
+      });
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        expect(offsets).to.deep.equal(['0', '20']);
+        const messages = (store?.getState()?.status?.entries ?? []).map((e: any) => e.message);
+        expect(messages.some((m: string) => /Search complete/.test(m))).to.be.true;
+      });
+    });
+
     // #262: when Discord refuses the thread search, the status log says
     // which HTTP status came back instead of a bare "Failed to search".
     it('logs the HTTP status when Discord refuses the thread search', () => {

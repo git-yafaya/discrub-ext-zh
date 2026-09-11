@@ -1757,6 +1757,75 @@ describe('messageSlice', () => {
       expect(mockDiscordService.fetchSearchMessageData).not.toHaveBeenCalled();
     });
 
+    // #264: Load More gets the #262 retries. A By User filter Discord has
+    // not indexed yet answers 202 on page 2, and the old raw call gave up
+    // at the first 25 results with a generic failure and no retry.
+    it('waits out a 202 on the next page and appends the page that follows (#264)', async () => {
+      const testStore = await createStoreWithApp();
+      const page2 = createMockMessages(25).map((m, i) => createMockMessage({ ...m, id: `p2-${i}` }));
+      const fetchSearchMessageData = vi.fn()
+        .mockResolvedValueOnce({
+          success: true,
+          status: 200,
+          data: { messages: [createMockMessages(25)], total_results: 50 },
+        })
+        .mockResolvedValueOnce({ success: true, status: 202 })
+        .mockResolvedValueOnce({
+          success: true,
+          status: 200,
+          data: { messages: [page2], total_results: 50 },
+        });
+      vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+      vi.mocked(addStatusEntry).mockClear();
+
+      await testStore.dispatch(
+        searchMessages({ channelId: 'channel-1', token: 'token', searchCriteria: { userIds: ['u1'] } as any })
+      );
+      const { fetchNextSearchPage } = await import('./messageSlice');
+      const result = await testStore.dispatch(
+        fetchNextSearchPage({ channelId: 'channel-1', token: 'token' })
+      );
+
+      expect(result.type).toBe('message/fetchNextSearchPage/fulfilled');
+      expect(fetchSearchMessageData).toHaveBeenCalledTimes(3);
+      const state = testStore.getState().message;
+      expect(state.messages).toHaveLength(50);
+      expect(state.pagination.searchOffset).toBe(50);
+      expect(state.pagination.hasMore).toBe(false);
+      const waits = vi.mocked(addStatusEntry).mock.calls.filter(
+        ([entry]: any[]) => entry?.level === 'warning' && /still indexing, retrying in 1s \(attempt 1\/5\)/.test(entry.message)
+      );
+      expect(waits).toHaveLength(1);
+    }, 10000);
+
+    it('rejects with the HTTP status when the next page is refused and keeps Load More available (#264)', async () => {
+      const testStore = await createStoreWithApp();
+      const fetchSearchMessageData = vi.fn()
+        .mockResolvedValueOnce({
+          success: true,
+          status: 200,
+          data: { messages: [createMockMessages(25)], total_results: 50 },
+        })
+        .mockResolvedValue({ success: false, status: 403 });
+      vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+      await testStore.dispatch(
+        searchMessages({ channelId: 'channel-1', token: 'token', searchCriteria: { userIds: ['u1'] } as any })
+      );
+      const { fetchNextSearchPage } = await import('./messageSlice');
+      const result = await testStore.dispatch(
+        fetchNextSearchPage({ channelId: 'channel-1', token: 'token' })
+      );
+
+      expect(result.type).toBe('message/fetchNextSearchPage/rejected');
+      expect(result.payload).toBe('Failed to search messages (HTTP 403)');
+      const state = testStore.getState().message;
+      expect(state.messages).toHaveLength(25);
+      expect(state.pagination.searchOffset).toBe(25);
+      expect(state.pagination.hasMore).toBe(true);
+      expect(state.pagination.isLoadingMore).toBe(false);
+    });
+
     it('dedupes by message id when a page overlaps with existing results', async () => {
       const testStore = await createStoreWithApp();
 
@@ -4310,6 +4379,90 @@ describe('messageSlice', () => {
         expect(tab.isLoading).toBe(false);
         expect(tab.pagination.mode).toBe('search');
         expect(tab.pagination.hasMore).toBe(false);
+      });
+
+      // #264: Discord's search returns spuriously short pages mid-stream
+      // (index lag). The thread walk used to stop on any page under 25 and
+      // then advanced the offset by a fixed 25, so a short page ended the
+      // search early and skipped results. Now it keeps paging until
+      // total_results is reached and advances by what came back.
+      it('keeps paging after a short page and advances the offset by the page size (#264)', async () => {
+        const page1 = createMockMessages(20);
+        const page2 = createMockMessages(20).map((m, i) => createMockMessage({ ...m, id: `p2-${i}` }));
+        const fetchSearchMessageData = vi.fn()
+          .mockResolvedValueOnce({ success: true, status: 200, data: { messages: [page1], total_results: 40 } })
+          .mockResolvedValueOnce({ success: true, status: 200, data: { messages: [page2], total_results: 40 } });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+        const testStore = await createStoreWithApp({
+          ...initialMessageState,
+          activeTab: 'thread-100',
+          threadTabs: {
+            'thread-100': {
+              threadId: 'thread-100',
+              threadName: 'Thread',
+              messages: [],
+              filteredMessages: [],
+              selectedMessages: [],
+              searchCriteria: null, refineCriteria: null,
+              order: initialMessageState.order,
+              isLoading: false,
+              error: null,
+              pagination: { ...initialMessageState.pagination },
+            },
+          },
+        });
+
+        const result = await testStore.dispatch(
+          searchThreadMessages({
+            threadId: 'thread-100',
+            token: 'token',
+            searchCriteria: { userIds: ['u1'] } as any,
+          })
+        );
+
+        expect(result.type).toBe('message/searchThreadMessages/fulfilled');
+        expect(fetchSearchMessageData).toHaveBeenCalledTimes(2);
+        // Second page starts where the short first page ended, not at 25.
+        expect(fetchSearchMessageData.mock.calls[1][1]).toBe(20);
+        expect(testStore.getState().message.threadTabs['thread-100'].messages).toHaveLength(40);
+      });
+
+      it('stops at total_results even when the last page is short (#264)', async () => {
+        const fetchSearchMessageData = vi.fn()
+          .mockResolvedValueOnce({ success: true, status: 200, data: { messages: [createMockMessages(25)], total_results: 30 } })
+          .mockResolvedValueOnce({
+            success: true,
+            status: 200,
+            data: { messages: [createMockMessages(5).map((m, i) => createMockMessage({ ...m, id: `p2-${i}` }))], total_results: 30 },
+          });
+        vi.mocked(discordService.getDiscordService).mockReturnValue({ fetchSearchMessageData } as any);
+
+        const testStore = await createStoreWithApp({
+          ...initialMessageState,
+          activeTab: 'thread-100',
+          threadTabs: {
+            'thread-100': {
+              threadId: 'thread-100',
+              threadName: 'Thread',
+              messages: [],
+              filteredMessages: [],
+              selectedMessages: [],
+              searchCriteria: null, refineCriteria: null,
+              order: initialMessageState.order,
+              isLoading: false,
+              error: null,
+              pagination: { ...initialMessageState.pagination },
+            },
+          },
+        });
+
+        await testStore.dispatch(
+          searchThreadMessages({ threadId: 'thread-100', token: 'token', searchCriteria: {} as any })
+        );
+
+        expect(fetchSearchMessageData).toHaveBeenCalledTimes(2);
+        expect(testStore.getState().message.threadTabs['thread-100'].messages).toHaveLength(30);
       });
 
       it('should dispatch starting and completion status entries on success', async () => {

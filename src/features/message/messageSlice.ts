@@ -1429,16 +1429,26 @@ export const fetchNextSearchPage = createAsyncThunk(
 
     try {
       const discordService = getDiscordService();
-      const response = await discordService.fetchSearchMessageData(
-        token,
-        pagination.searchOffset,
-        channelId || null,
-        guildId || null,
-        searchCriteria
+      // #264: the next page gets the same 202 wait and transient retry as
+      // the first one. A filter combination Discord has not indexed yet
+      // (a By User filter is the common case) answers 202 on page 2, and
+      // without the wait "Load More" gave up at the first 25 results.
+      const response = await fetchSearchPageWithRetry(
+        () => discordService.fetchSearchMessageData(
+          token,
+          pagination.searchOffset,
+          channelId || null,
+          guildId || null,
+          searchCriteria
+        ),
+        searchPageRetryHooks(dispatch, getState as () => RootState),
       );
 
       if (!response.success || !response.data) {
-        return rejectWithValue('Failed to fetch next search page');
+        if (checkCancelled(getState as () => RootState)) {
+          return rejectWithValue('Search cancelled');
+        }
+        return rejectWithValue(describeSearchFailure(response, 'channel'));
       }
 
       const rawMessages = response.data.messages
@@ -2622,11 +2632,16 @@ export const searchThreadMessages = createAsyncThunk(
             milestoneBoundary = nextMilestone(fetched);
           }
 
-          if (messages.length < 25 || batchMessages.length >= searchResult.total_results) {
+          // #264: a short page mid-stream is not the end (#208 parity with
+          // the channel path); Discord's search returns spuriously short
+          // pages while its index lags. Only an empty page (handled above)
+          // or reaching total_results ends the walk, and the offset advances
+          // by what actually came back so a short page skips nothing.
+          if (batchMessages.length >= searchResult.total_results) {
             break;
           }
 
-          offset += 25;
+          offset += rawMessages.length;
 
           const delayCalc = calculateRandomDelay(searchDelay, delayModifier);
           const wasCancelled = await cancellableDelay(delayCalc.delayMs, getState as () => RootState);

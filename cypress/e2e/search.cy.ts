@@ -458,6 +458,105 @@ describe('Search & Filters', () => {
       cy.contains('[data-testid="message-feed-row"]', 'Final paginated result').should('exist');
     });
 
+    // #264: Load More (the next search page) gets the same 202 wait as the
+    // first page. A filter Discord has not indexed yet (By User is the
+    // common case) answers 202 on page 2; the old raw call gave up at the
+    // first 25 with a generic failure line.
+    const buildPage = (offset: number, count: number, total: number) => ({
+      messages: Array.from({ length: count }, (_, i) => [{
+        id: `800000000000000${String(offset + i).padStart(3, '0')}`,
+        channel_id: '801000000000000001',
+        author: { id: '222333444555666777', username: 'alice_dev', discriminator: '0', avatar: 'alice_avatar', global_name: 'Alice' },
+        content: `Search result message ${offset + i + 1}`,
+        timestamp: `2026-02-01T12:${String((offset + i) % 60).padStart(2, '0')}:00.000Z`,
+        edited_timestamp: null, tts: false, mention_everyone: false, mentions: [], attachments: [], embeds: [], reactions: [], pinned: false, type: 0,
+      }]),
+      total_results: total,
+      threads: [],
+    });
+
+    const disableReactions = () => {
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        store.dispatch({
+          type: 'app/updateSetting/fulfilled',
+          payload: { ...store.getState().app.settings, reactionsEnabled: 'false' },
+        });
+      });
+    };
+
+    it('Load More waits out a 202 on the next page and appends it (#264)', () => {
+      disableReactions();
+      let call = 0;
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, (req) => {
+        call += 1;
+        if (call === 1) {
+          req.reply({ statusCode: 200, body: buildPage(0, 25, 30) });
+        } else if (call === 2) {
+          req.reply({ statusCode: 202, body: { retry_after: 1 } });
+        } else {
+          req.reply({ statusCode: 200, body: buildPage(25, 5, 30) });
+        }
+      }).as('pagedSearch');
+
+      searchViaModal('result');
+      cy.wait('@pagedSearch');
+      cy.contains('25 of 30 matches loaded').should('be.visible');
+
+      // A Cypress click scrolls the button into view first, and that scroll
+      // event fires the feed's own Load More listener, which hides the
+      // button mid-click. A native click on the element as found skips the
+      // scroll and dispatches exactly once.
+      cy.get('[data-testid="message-feed-load-more"]').then(($btn) => { $btn[0].click(); });
+      cy.wait('@pagedSearch');
+      cy.wait('@pagedSearch', { timeout: 10000 });
+
+      cy.contains('[data-testid="message-feed-row"]', 'Search result message 30', { timeout: 10000 }).should('exist');
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        const messages = (store?.getState()?.status?.entries ?? []).map((e: any) => e.message);
+        expect(
+          messages.some((m: string) => /^Search: Discord is still indexing, retrying in 1s \(attempt 1\/5\)/.test(m)),
+        ).to.be.true;
+        expect(messages.some((m: string) => /fetchNextSearchPage: /.test(m))).to.be.false;
+        expect(store.getState().message.messages.length).to.equal(30);
+        expect(store.getState().message.pagination.hasMore).to.be.false;
+      });
+    });
+
+    it('Load More says which HTTP status Discord answered and stays available (#264)', () => {
+      disableReactions();
+      let call = 0;
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, (req) => {
+        call += 1;
+        if (call === 1) {
+          req.reply({ statusCode: 200, body: buildPage(0, 25, 30) });
+        } else {
+          req.reply({ statusCode: 403, body: { message: 'Missing Access', code: 50001 } });
+        }
+      }).as('pagedSearch');
+
+      searchViaModal('result');
+      cy.wait('@pagedSearch');
+      cy.contains('25 of 30 matches loaded').should('be.visible');
+
+      cy.contains('button', 'Load more messages').click();
+      cy.wait('@pagedSearch');
+
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        const entries = store?.getState()?.status?.entries ?? [];
+        const failure = entries.find((e: any) => /message\/fetchNextSearchPage: /.test(e.message));
+        expect(failure, 'Load More failure entry').to.exist;
+        expect(failure.level).to.equal('error');
+        expect(failure.message).to.equal('message/fetchNextSearchPage: Failed to search messages (HTTP 403)');
+        expect(store.getState().message.messages.length).to.equal(25);
+        expect(store.getState().message.pagination.hasMore).to.be.true;
+        expect(store.getState().message.pagination.isLoadingMore).to.be.false;
+      });
+      cy.contains('button', 'Load more messages').should('be.visible');
+    });
+
     // #185 Bug A: a single transient failure during search Load All gets
     // retried automatically; the user sees a [WARN] status entry but the
     // operation finishes with the full match set, not a dropped half-load.

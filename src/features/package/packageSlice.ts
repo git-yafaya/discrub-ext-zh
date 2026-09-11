@@ -1084,7 +1084,15 @@ async function runSearchPreflight(args: {
       packageHitsSoFar: packageHitsTotal,
     });
 
-    if (rawCount < SEARCH_PREFLIGHT_PAGE_SIZE) break;
+    // #264: a short page is only the end when Discord says so. Its search
+    // returns spuriously short pages mid-stream while the index lags, so
+    // keep walking while total_results says there is more; a page with no
+    // results, or a response without total_results, ends the scan the old way.
+    if (rawCount === 0) break;
+    const totalResults = searchResult.total_results;
+    if (typeof totalResults === 'number'
+      ? offset + rawCount >= totalResults
+      : rawCount < SEARCH_PREFLIGHT_PAGE_SIZE) break;
     offset += rawCount;
     if (offset > SEARCH_PREFLIGHT_MAX_OFFSET) {
       status = 'cap-exceeded';

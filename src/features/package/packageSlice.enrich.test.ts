@@ -693,6 +693,33 @@ describe('packageSlice — enrichPackageChannel', () => {
     expect(Object.keys(state.enrichedMessages['200'])).toEqual(['1', '2', '3']);
   });
 
+  // #264: a short search page mid-stream is index lag, not the end. The
+  // preflight used to stop on any page under 25, missing the hits on the
+  // pages after it.
+  it('preflight: keeps paging after a short page while total_results says there is more', async () => {
+    mockFetchSearchMessageData
+      .mockResolvedValueOnce({
+        success: true,
+        status: 200,
+        data: { messages: [liveMessage('1')], threads: [], total_results: 3 },
+      })
+      .mockResolvedValueOnce({
+        success: true,
+        status: 200,
+        data: { messages: [liveMessage('2'), liveMessage('3')], threads: [], total_results: 3 },
+      });
+    const store = await primedStore();
+
+    await store.dispatch(enrichPackageChannel({ channelId: '200' }));
+
+    expect(mockFetchSearchMessageData).toHaveBeenCalledTimes(2);
+    // Page 2 starts after the one result page 1 returned.
+    expect(mockFetchSearchMessageData.mock.calls[1][1]).toBe(1);
+    expect(mockFetchMessageData).not.toHaveBeenCalled();
+    const state = store.getState().package;
+    expect(Object.keys(state.enrichedMessages['200'])).toEqual(['1', '2', '3']);
+  });
+
   it('preflight: gaps in search results fall through to AROUND loop', async () => {
     // Preflight finds '1' and '3' but not '2' (deleted or indexing lag).
     mockFetchSearchMessageData.mockResolvedValueOnce({
