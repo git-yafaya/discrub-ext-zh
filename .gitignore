@@ -81,3 +81,4 @@ vite.config.ts.timestamp-*
 # Discrub Classic source checkouts/vendoring (see scripts/build-classic.mjs)
 .classic-src/
 classic-source/
+dist-perf/

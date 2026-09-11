@@ -77,6 +77,8 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.EXTENSION_MODE': JSON.stringify(true),
       'import.meta.env.BROWSER': JSON.stringify(isFirefox ? 'firefox' : 'chrome'),
       'import.meta.env.VITE_DISCORD_TOKEN': JSON.stringify(''),
+      // #263: perf hooks never ship in an extension build.
+      'import.meta.env.VITE_PERF_HOOKS': JSON.stringify(''),
       // Battle-test switch: DISCRUB_BRIDGE_ONLY=1 disables the localStorage token
       // path so the MAIN-world bridge is verified on its own. Off in normal builds.
       'import.meta.env.DISCRUB_BRIDGE_ONLY': JSON.stringify(

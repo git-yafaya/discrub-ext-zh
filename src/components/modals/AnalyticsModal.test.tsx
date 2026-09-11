@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderWithProviders, screen, fireEvent, within } from '../../test/test-utils';
 import AnalyticsModal from './AnalyticsModal';
+import { ANALYTICS_REPORTS } from '@/utils/analyticsReports';
 import { createBaseState } from '../../test/state-factories';
 import type { Message } from 'discrub-core/types/discord-types';
 
@@ -64,6 +65,15 @@ const mockOnClose = vi.fn();
 describe('AnalyticsModal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  // #263: the modal stays mounted while closed; it must not run a report
+  // over the whole feed every time the messages array changes.
+  it('does not compute a report while closed', () => {
+    const spy = vi.spyOn(ANALYTICS_REPORTS.mentions, 'compute');
+    render([createMessage('hi <@222>')], { open: false });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
   });
 
   it('opens on the Mentions report with the report title', () => {

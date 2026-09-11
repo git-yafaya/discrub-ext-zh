@@ -38,7 +38,7 @@ interface MessageChunkProps {
   onOpenThread?: (message: Message) => void;
 }
 
-const MessageChunk = memo(function MessageChunk({
+const MessageChunk = function MessageChunk({
   chunk,
   selectedIds,
   highlightedMessageId,
@@ -250,6 +250,20 @@ const MessageChunk = memo(function MessageChunk({
       </Box>
     </Box>
   );
-});
+};
 
-export default MessageChunk;
+/**
+ * #263: the feed rebuilds `selectedIds` on every selection change, which
+ * would re-render every visible chunk for one click. Treat two Sets as
+ * equal for a chunk when none of its messages changed membership.
+ */
+export const chunkPropsAreEqual = (prev: MessageChunkProps, next: MessageChunkProps): boolean => {
+  for (const key of Object.keys(next) as (keyof MessageChunkProps)[]) {
+    if (key === 'selectedIds') continue;
+    if (prev[key] !== next[key]) return false;
+  }
+  if (prev.selectedIds === next.selectedIds) return true;
+  return next.chunk.messages.every((m) => prev.selectedIds.has(m.id) === next.selectedIds.has(m.id));
+};
+
+export default memo(MessageChunk, chunkPropsAreEqual);

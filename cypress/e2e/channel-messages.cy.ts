@@ -214,4 +214,61 @@ describe('Channel Messages', () => {
       ).to.be.true;
     });
   });
+  // #263: Load All merges each page at the end of the list instead of
+  // re-sorting everything. Pages must still land in feed order.
+  it('keeps the feed newest-first across Load All pages (#263)', () => {
+    const makeBatch = (offset: number, count: number) =>
+      Array.from({ length: count }, (_, i) => {
+        const n = offset + i;
+        return {
+          id: `710000000000000${String(999 - n).padStart(3, '0')}`,
+          channel_id: '801000000000000001',
+          author: {
+            id: '111222333444555666',
+            username: 'discrub_tester',
+            discriminator: '0',
+            avatar: 'abc123avatar',
+            global_name: 'Discrub Tester',
+          },
+          content: `Ordered ${n}`,
+          // Later batches are older, like Discord's history walk.
+          timestamp: new Date(2026, 1, 1, 12, 0, 0, 0 - n * 1000).toISOString(),
+          edited_timestamp: null,
+          tts: false,
+          mention_everyone: false,
+          mentions: [],
+          attachments: [],
+          embeds: [],
+          reactions: [],
+          pinned: false,
+          type: 0,
+        };
+      });
+
+    let call = 0;
+    cy.intercept('GET', '**/api/v10/channels/*/messages?*', (req) => {
+      call += 1;
+      if (call === 1) req.reply({ statusCode: 200, body: makeBatch(0, 100) });
+      else if (call === 2) req.reply({ statusCode: 200, body: makeBatch(100, 100) });
+      else req.reply({ statusCode: 200, body: makeBatch(200, 30) });
+    }).as('messagesOrdered');
+
+    cy.contains('general').click();
+    cy.wait('@messagesOrdered');
+    cy.contains('button', 'Load All').click();
+    cy.get('[role="dialog"]').contains('button', 'Load All').click();
+    cy.contains('230 messages', { timeout: 20000 }).should('be.visible');
+
+    cy.window().its('__store__').should((store: any) => {
+      const messages = store.getState().message.messages;
+      expect(messages).to.have.length(230);
+      const times = messages.map((m: any) => new Date(m.timestamp).getTime());
+      for (let i = 1; i < times.length; i += 1) {
+        expect(times[i]).to.be.at.most(times[i - 1]);
+      }
+      expect(messages[0].content).to.equal('Ordered 0');
+      expect(messages[229].content).to.equal('Ordered 229');
+      expect(store.getState().message.filteredMessages).to.equal(messages);
+    });
+  });
 });

@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
+import { screen, fireEvent, act, waitFor } from '@testing-library/react';
+import { renderWithProviders as render } from '../../test/test-utils';
 import MessageActions from './MessageActions';
+import { initialMessageState, initialPaginationState } from '@features/message/messageTypes';
 import { createMockMessage, createMockEmbed } from '../../test/fixtures';
 
 // Stub the add-reactions modal so this gating test doesn't load the emoji dataset.
@@ -19,6 +21,56 @@ describe('MessageActions', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  // #263: the toolbar reads the selection from the store when the prop is
+  // omitted, so ServerView no longer re-renders on every selection change.
+  describe('Store-backed selection', () => {
+    it('reads the selection from the store when no prop is given', () => {
+      const { selectedMessages: _omit, ...rest } = defaultProps;
+      render(<MessageActions {...rest} />, {
+        preloadedState: {
+          message: {
+            ...initialMessageState,
+            selectedMessages: [createMockMessage({ id: 'a' }), createMockMessage({ id: 'b' })],
+          },
+        } as any,
+      });
+      expect(screen.getByText('2 selected')).toBeInTheDocument();
+    });
+
+    it('reads the active thread tab selection when a thread tab is open', () => {
+      const { selectedMessages: _omit, ...rest } = defaultProps;
+      render(<MessageActions {...rest} />, {
+        preloadedState: {
+          message: {
+            ...initialMessageState,
+            selectedMessages: [createMockMessage({ id: 'main-1' })],
+            activeTab: 'thread-1',
+            threadTabs: {
+              'thread-1': {
+                threadId: 'thread-1',
+                threadName: 'Thread 1',
+                messages: [],
+                filteredMessages: [],
+                selectedMessages: [
+                  createMockMessage({ id: 't-1' }),
+                  createMockMessage({ id: 't-2' }),
+                  createMockMessage({ id: 't-3' }),
+                ],
+                searchCriteria: null,
+                refineCriteria: null,
+                order: initialMessageState.order,
+                isLoading: false,
+                error: null,
+                pagination: initialPaginationState,
+              },
+            },
+          },
+        } as any,
+      });
+      expect(screen.getByText('3 selected')).toBeInTheDocument();
+    });
   });
 
   describe('Selection Count', () => {

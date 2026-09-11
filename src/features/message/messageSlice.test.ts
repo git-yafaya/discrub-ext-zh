@@ -8,6 +8,8 @@ const setOnline = (online: boolean) =>
 afterEach(() => setOnline(true));
 
 import messageReducer, {
+  messagesEdited,
+  setThreadRefineCriteria,
   setMessages,
   setFilteredMessages,
   setSelectedMessages,
@@ -654,6 +656,100 @@ describe('messageSlice', () => {
       expect(warning).toBeTruthy();
     });
   });
+
+  describe('#263 plain-array reducers', () => {
+    it('toggleMessageSelection adds then removes the same message and never mutates the previous array', () => {
+      const msgs = createMockMessages(3);
+      store.dispatch(setMessages(msgs));
+      store.dispatch(toggleMessageSelection(msgs[1]));
+      const afterAdd = store.getState().message.selectedMessages;
+      expect(afterAdd.map((m: Message) => m.id)).toEqual(['msg-2']);
+
+      store.dispatch(toggleMessageSelection(msgs[0]));
+      const afterSecond = store.getState().message.selectedMessages;
+      expect(afterSecond.map((m: Message) => m.id)).toEqual(['msg-2', 'msg-1']);
+      expect(afterAdd.map((m: Message) => m.id)).toEqual(['msg-2']);
+
+      store.dispatch(toggleMessageSelection(msgs[1]));
+      expect(store.getState().message.selectedMessages.map((m: Message) => m.id)).toEqual(['msg-1']);
+    });
+
+    it('selectAllMessages copies filteredMessages instead of sharing the array', () => {
+      const msgs = createMockMessages(3);
+      store.dispatch(setMessages(msgs));
+      store.dispatch(setFilteredMessages([msgs[0], msgs[2]]));
+      store.dispatch(selectAllMessages());
+      const state = store.getState().message;
+      expect(state.selectedMessages.map((m: Message) => m.id)).toEqual(['msg-1', 'msg-3']);
+      expect(state.selectedMessages).not.toBe(state.filteredMessages);
+    });
+
+    it('toggleThreadMessageSelection adds then removes inside the thread tab only', () => {
+      const msgs = createMockMessages(2);
+      store.dispatch(setMessages(msgs));
+      store.dispatch(addThreadTab({ threadId: 'thread-1', threadName: 'Thread 1' }));
+      const tmsg = createMockMessage({ id: 'tmsg-1' });
+      store.dispatch(setThreadMessages({ threadId: 'thread-1', messages: [tmsg] }));
+
+      store.dispatch(toggleThreadMessageSelection({ threadId: 'thread-1', message: tmsg }));
+      expect(store.getState().message.threadTabs['thread-1'].selectedMessages.map((m: Message) => m.id)).toEqual(['tmsg-1']);
+      expect(store.getState().message.selectedMessages).toEqual([]);
+
+      store.dispatch(toggleThreadMessageSelection({ threadId: 'thread-1', message: tmsg }));
+      expect(store.getState().message.threadTabs['thread-1'].selectedMessages).toEqual([]);
+    });
+
+    it('messagesEdited replaces the given ids in messages, filteredMessages, and selectedMessages', () => {
+      const msgs = createMockMessages(3);
+      store.dispatch(setMessages(msgs));
+      store.dispatch(setFilteredMessages([msgs[1], msgs[2]]));
+      store.dispatch(setSelectedMessages([msgs[1]]));
+      const edited = { ...msgs[1], content: 'edited' };
+
+      store.dispatch(messagesEdited({ messages: [edited, createMockMessage({ id: 'unknown' })], containerId: null }));
+
+      const state = store.getState().message;
+      expect(state.messages.map((m: Message) => m.content)).toEqual(['Test message 1', 'edited', 'Test message 3']);
+      expect(state.filteredMessages.map((m: Message) => m.content)).toEqual(['edited', 'Test message 3']);
+      expect(state.selectedMessages.map((m: Message) => m.content)).toEqual(['edited']);
+      expect(state.messages).toHaveLength(3);
+    });
+
+    it('messagesEdited targets the thread container named in the payload', () => {
+      store.dispatch(setMessages(createMockMessages(1)));
+      store.dispatch(addThreadTab({ threadId: 'thread-1', threadName: 'Thread 1' }));
+      const tmsg = createMockMessage({ id: 'tmsg-1', content: 'before' });
+      store.dispatch(setThreadMessages({ threadId: 'thread-1', messages: [tmsg] }));
+
+      store.dispatch(messagesEdited({ messages: [{ ...tmsg, content: 'after' }], containerId: 'thread-1' }));
+
+      const state = store.getState().message;
+      expect(state.threadTabs['thread-1'].messages[0].content).toBe('after');
+      expect(state.messages[0].content).toBe('Test message 1');
+    });
+
+    it('setThreadRefineCriteria filters the tab from its raw messages and clears back to all', () => {
+      store.dispatch(setMessages(createMockMessages(1)));
+      store.dispatch(addThreadTab({ threadId: 'thread-1', threadName: 'Thread 1' }));
+      const a = createMockMessage({ id: 'ta', author: createMockUser({ id: 'user-a' }) });
+      const b = createMockMessage({ id: 'tb', author: createMockUser({ id: 'user-b' }) });
+      store.dispatch(setThreadMessages({ threadId: 'thread-1', messages: [a, b] }));
+
+      store.dispatch(setThreadRefineCriteria({ threadId: 'thread-1', criteria: { userIds: ['user-b'] } as any }));
+      expect(store.getState().message.threadTabs['thread-1'].filteredMessages.map((m: Message) => m.id)).toEqual(['tb']);
+      expect(store.getState().message.threadTabs['thread-1'].messages).toHaveLength(2);
+
+      store.dispatch(setThreadRefineCriteria({ threadId: 'thread-1', criteria: null }));
+      expect(store.getState().message.threadTabs['thread-1'].filteredMessages.map((m: Message) => m.id)).toEqual(['ta', 'tb']);
+    });
+
+    it('setThreadRefineCriteria ignores a thread tab that does not exist', () => {
+      const before = store.getState().message;
+      store.dispatch(setThreadRefineCriteria({ threadId: 'nope', criteria: { userIds: ['x'] } as any }));
+      expect(store.getState().message).toBe(before);
+    });
+  });
+
 
   describe('messagesRemoved reducer (#183)', () => {
     it('removes exactly the given ids from messages, filteredMessages, and selectedMessages in one dispatch', () => {
@@ -6527,6 +6623,31 @@ describe('messageSlice', () => {
         expect(snapshots[0]).toBe(0);
         expect(snapshots[1]).toBe(25);
         expect(testStore.getState().message.messages).toHaveLength(50);
+      });
+
+      // #263: each Load All page used to re-sort (and copy) the whole list;
+      // now a page in order is merged at one end and, with no refine
+      // active, filteredMessages is the same array rather than a copy.
+      it('appendLoadAllPage keeps DESC order across pages and shares filteredMessages when no refine is active', () => {
+        const at = (id: string, secondsAgo: number) => createMockMessage({ id, timestamp: new Date(Date.UTC(2026, 0, 1) - secondsAgo * 1000).toISOString() });
+        const appendLoadAllPage = (payload: { messages: Message[] }) => ({ type: 'message/appendLoadAllPage', payload });
+        // getSortedMessages is an identity mock in this file, so pages arrive
+        // already in page order (as Discord sends them); the out-of-order
+        // fallback is covered in messageOrdering.test.ts against the real sort.
+        let state = messageReducer(initialMessageState, appendLoadAllPage({ messages: [at('a', 0), at('b', 10)] }));
+        state = messageReducer(state, appendLoadAllPage({ messages: [at('c', 20), at('d', 30)] }));
+        expect(state.messages.map((m) => m.id)).toEqual(['a', 'b', 'c', 'd']);
+        expect(state.filteredMessages).toBe(state.messages);
+        expect(state.messages[0]).toBe(state.messages[0]);
+      });
+
+      it('appendLoadAllPage keeps ASC order when the feed is sorted oldest first', () => {
+        const at = (id: string, secondsAgo: number) => createMockMessage({ id, timestamp: new Date(Date.UTC(2026, 0, 1) - secondsAgo * 1000).toISOString() });
+        const appendLoadAllPage = (payload: { messages: Message[] }) => ({ type: 'message/appendLoadAllPage', payload });
+        const asc = { ...initialMessageState, order: { ...initialMessageState.order, order: SortDirection.ASCENDING } };
+        let state = messageReducer(asc, appendLoadAllPage({ messages: [at('b', 10), at('a', 0)] }));
+        state = messageReducer(state, appendLoadAllPage({ messages: [at('d', 30), at('c', 20)] }));
+        expect(state.messages.map((m) => m.id)).toEqual(['d', 'c', 'b', 'a']);
       });
 
       it('dedupes overlapping ids across appendLoadAllPage dispatches', async () => {

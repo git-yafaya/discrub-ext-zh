@@ -36,6 +36,7 @@ import {
   parseTerms,
   type OverviewStats,
   type ReportId,
+  type ReportResult,
   type ReportRow,
   type UserMap,
   BESTOF_MIN_REACTIONS,
@@ -69,6 +70,8 @@ type SortDir = 'asc' | 'desc';
  * results). Everything is computed synchronously from the `messages` prop, so
  * a Refine or a Load All changes the numbers live.
  */
+const CLOSED_RESULT: ReportResult = { rows: [], empty: '' };
+
 const AnalyticsModal = ({ open, onClose, messages, userMap, containerId, threadNames, initialReport = 'mentions' }: AnalyticsModalProps) => {
   const { t } = useTranslation();
   const dispatch = useAppDispatch();
@@ -90,9 +93,12 @@ const AnalyticsModal = ({ open, onClose, messages, userMap, containerId, threadN
 
   const terms = useMemo(() => parseTerms(termsText), [termsText]);
 
-  const result = useMemo(
-    () => report.compute(scopedMessages, { userMap, terms, threadNames, containerId }),
-    [report, scopedMessages, userMap, terms, threadNames, containerId],
+  // #263: the modal stays mounted while closed, and a closed modal used to
+  // recompute the report every time the feed's messages array changed (every
+  // bulk-delete flush at 30K messages). Only compute while open.
+  const result = useMemo<ReportResult>(
+    () => (open ? report.compute(scopedMessages, { userMap, terms, threadNames, containerId }) : CLOSED_RESULT),
+    [open, report, scopedMessages, userMap, terms, threadNames, containerId],
   );
 
   const sorted = useMemo(() => {

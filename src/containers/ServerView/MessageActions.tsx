@@ -17,9 +17,14 @@ import EmbedModal from '@components/modals/EmbedModal';
 import ReactionRemovalModal from '@components/modals/ReactionRemovalModal';
 import AddReactionsModal from '@components/modals/AddReactionsModal';
 import { useTranslation } from 'react-i18next';
+import { useAppSelector } from '@/app/hooks';
+import { selectActiveSelectedMessages } from '@features/message/messageSlice';
 
 interface MessageActionsProps {
-  selectedMessages: Message[];
+  /** #263: read from the store when omitted, so the parent view does not
+   *  re-render its whole tree on every selection change. Tests and stories
+   *  may still pass it. */
+  selectedMessages?: Message[];
   onDelete: (messages: Message[]) => Promise<void>;
   onEdit: (message: Message, newContent: string) => Promise<void>;
   onBulkEdit?: (messages: Message[], newContent: string) => Promise<void>;
@@ -45,7 +50,7 @@ interface MessageActionsProps {
  * MessageActions - toolbar for message operations
  */
 const MessageActions = ({
-  selectedMessages,
+  selectedMessages: selectedMessagesProp,
   onDelete,
   onEdit,
   onBulkEdit,
@@ -62,6 +67,8 @@ const MessageActions = ({
   onFetchReactingUsers,
 }: MessageActionsProps) => {
   const { t } = useTranslation();
+  const selectedFromStore = useAppSelector(selectActiveSelectedMessages);
+  const selectedMessages = selectedMessagesProp ?? selectedFromStore;
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [embedModalOpen, setEmbedModalOpen] = useState(false);

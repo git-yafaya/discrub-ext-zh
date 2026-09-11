@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -118,8 +119,12 @@ interface RailEntry {
   key: string;
   title: string;
   date: string | null;
+  /** `date` formatted once; the modal re-renders with its parent while closed (#263). */
+  dateLabel: string | null;
   markdown: string | null;
 }
+
+const NO_ARCHIVE: NonNullable<AnnouncementModalProps['archive']> = [];
 
 const AnnouncementModal = ({
   open,
@@ -136,24 +141,37 @@ const AnnouncementModal = ({
   const { t } = useTranslation();
   const theme = useTheme();
   const narrow = useMediaQuery(theme.breakpoints.down('sm'));
-  const archiveEntries = archive ?? [];
+  const archiveEntries = archive ?? NO_ARCHIVE;
 
   // The live announcement heads the rail. When the archive already holds it
   // (same first heading; the release step copies the text over), reuse that
   // row's title and date instead of listing it twice.
-  const liveHeading = headingOf(markdown);
-  const liveMatch = liveHeading ? archiveEntries.find((entry) => headingOf(entry.markdown) === liveHeading) : undefined;
-  const rail: RailEntry[] = [
-    {
-      key: LIVE_ENTRY_KEY,
-      title: liveMatch?.title ?? t('announcement.latest'),
-      date: liveMatch?.date ?? null,
-      markdown,
-    },
-    ...archiveEntries
-      .filter((entry) => entry !== liveMatch)
-      .map((entry) => ({ key: entry.version, title: entry.title, date: entry.date, markdown: entry.markdown })),
-  ];
+  // #263: built once per archive/markdown change, not per parent render;
+  // the date formatting (an Intl formatter per call) showed up in the
+  // bulk-delete profile while this modal was closed.
+  const { rail, liveMatch } = useMemo(() => {
+    const liveHeading = headingOf(markdown);
+    const match = liveHeading ? archiveEntries.find((entry) => headingOf(entry.markdown) === liveHeading) : undefined;
+    const entries: RailEntry[] = [
+      {
+        key: LIVE_ENTRY_KEY,
+        title: match?.title ?? t('announcement.latest'),
+        date: match?.date ?? null,
+        dateLabel: match?.date ? formatArchiveDate(match.date) : null,
+        markdown,
+      },
+      ...archiveEntries
+        .filter((entry) => entry !== match)
+        .map((entry) => ({
+          key: entry.version,
+          title: entry.title,
+          date: entry.date,
+          dateLabel: entry.date ? formatArchiveDate(entry.date) : null,
+          markdown: entry.markdown,
+        })),
+    ];
+    return { rail: entries, liveMatch: match };
+  }, [archiveEntries, markdown, t]);
   const hasArchive = archiveEntries.length > 0;
   const selectedKey = selectedVersion ?? LIVE_ENTRY_KEY;
   const selected = rail.find((entry) => entry.key === selectedKey) ?? rail[0];
@@ -162,7 +180,7 @@ const AnnouncementModal = ({
   const pick = (key: string) => onSelectVersion?.(key === LIVE_ENTRY_KEY ? null : key);
 
   const title = showingLive && !liveMatch ? t('announcement.title') : selected.title;
-  const byline = selected.date ? formatArchiveDate(selected.date) : null;
+  const byline = selected.dateLabel;
 
   const railNode = hasArchive && (
     narrow ? (
@@ -177,7 +195,7 @@ const AnnouncementModal = ({
         {rail.map((entry) => (
           <MenuItem key={entry.key} value={entry.key}>
             {entry.title}
-            {entry.date ? ` · ${formatArchiveDate(entry.date)}` : ''}
+            {entry.dateLabel ? ` · ${entry.dateLabel}` : ''}
           </MenuItem>
         ))}
       </Select>
@@ -206,7 +224,7 @@ const AnnouncementModal = ({
           >
             <ListItemText
               primary={entry.title}
-              secondary={entry.date ? formatArchiveDate(entry.date) : undefined}
+              secondary={entry.dateLabel ?? undefined}
               primaryTypographyProps={{ fontWeight: entry.key === selected.key ? 600 : 400 }}
             />
           </ListItemButton>

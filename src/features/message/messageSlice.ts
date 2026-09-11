@@ -1,7 +1,8 @@
-import { createSlice, createAsyncThunk, createSelector, PayloadAction } from '@reduxjs/toolkit';
+import { createSlice, createAsyncThunk, createSelector, isDraft, original, PayloadAction } from '@reduxjs/toolkit';
 import type { Message, Attachment, User, Channel } from 'discrub-core/types/discord-types';
 import type { SearchCriteria } from 'discrub-core/types/discrub-types';
 import { getSortedMessages } from 'discrub-core/discrub-utils';
+import { appendSortedPage } from './messageOrdering';
 import { ReactionType, IsPinnedType } from 'discrub-core/discord-enum';
 import { MessageOrder, initialMessageState, initialPaginationState, ThreadTabState } from './messageTypes';
 import { getDiscordService } from '@services/discordService';
@@ -2270,8 +2271,8 @@ export const fetchMoreThreadMessages = createAsyncThunk(
       const tab = state.message.threadTabs[threadId];
       if (!tab) return rejectWithValue('Thread tab no longer exists');
 
-      const combined = [...tab.messages, ...newMessages];
-      const sorted = getSortedMessages(combined, tab.order.order);
+      // #263: same end-merge as appendLoadAllPage, no full re-sort per page.
+      const sorted = appendSortedPage(tab.messages, newMessages, tab.order.order);
 
       dispatch(messageSlice.actions.setThreadMessages({ threadId, messages: sorted }));
       dispatch(messageSlice.actions.updateThreadPagination({
@@ -2736,6 +2737,17 @@ const getActiveContainer = (state: import('./messageTypes').MessageState) => {
  * container's arrays. Returns null when the captured thread tab no
  * longer exists (nothing left to update).
  */
+/**
+ * #263: the plain (non-draft) array behind a draft field. Iterating an
+ * Immer draft array creates a proxy per element touched, so a `filter`,
+ * `findIndex`, spread or `map` over a 30K-message draft costs tens of
+ * milliseconds before any real work. Reducers below read through this and
+ * assign a fresh array instead of mutating the draft in place. Only valid
+ * before the field is reassigned in the same reducer (original() is the
+ * base value).
+ */
+const plain = <T,>(arr: T[]): T[] => (isDraft(arr) ? (original(arr) as T[]) : arr);
+
 const resolveCapturedContainer = (
   state: import('./messageTypes').MessageState,
   containerId: string | null,
@@ -2759,17 +2771,16 @@ const messageSlice = createSlice({
       state.selectedMessages = action.payload;
     },
     toggleMessageSelection: (state, action: PayloadAction<Message>) => {
-      const index = state.selectedMessages.findIndex(
-        (msg: Message) => msg.id === action.payload.id
-      );
-      if (index >= 0) {
-        state.selectedMessages.splice(index, 1);
-      } else {
-        state.selectedMessages.push(action.payload);
-      }
+      // #263: work on the plain array and assign a new one; a splice/push
+      // on a 30K draft walks every element through a proxy.
+      const base = plain(state.selectedMessages);
+      const index = base.findIndex((msg: Message) => msg.id === action.payload.id);
+      state.selectedMessages = index >= 0
+        ? base.filter((_, i) => i !== index)
+        : [...base, action.payload];
     },
     selectAllMessages: (state) => {
-      state.selectedMessages = [...state.filteredMessages];
+      state.selectedMessages = plain(state.filteredMessages).slice();
     },
     // #183: batched removal used by the bulk-delete loop. One Set lookup +
     // one filter pass per array for the whole batch, instead of a full
@@ -2783,9 +2794,9 @@ const messageSlice = createSlice({
       const container = resolveCapturedContainer(state, action.payload.containerId);
       if (!container) return;
       const ids = new Set(action.payload.ids);
-      container.messages = container.messages.filter((m) => !ids.has(m.id));
-      container.filteredMessages = container.filteredMessages.filter((m) => !ids.has(m.id));
-      container.selectedMessages = container.selectedMessages.filter((m) => !ids.has(m.id));
+      container.messages = plain(container.messages).filter((m) => !ids.has(m.id));
+      container.filteredMessages = plain(container.filteredMessages).filter((m) => !ids.has(m.id));
+      container.selectedMessages = plain(container.selectedMessages).filter((m) => !ids.has(m.id));
     },
     // F13 (#183 follow-up): batched in-place replacement used by the
     // bulk-edit loop — same shape as messagesRemoved. Pre-fix, bulk edit
@@ -2797,7 +2808,7 @@ const messageSlice = createSlice({
       const container = resolveCapturedContainer(state, action.payload.containerId);
       if (!container) return;
       const byId = new Map(action.payload.messages.map((m) => [m.id, m]));
-      const replaceInArray = (arr: Message[]) => arr.map((m) => byId.get(m.id) ?? m);
+      const replaceInArray = (arr: Message[]) => plain(arr).map((m) => byId.get(m.id) ?? m);
       container.messages = replaceInArray(container.messages);
       container.filteredMessages = replaceInArray(container.filteredMessages);
       container.selectedMessages = replaceInArray(container.selectedMessages);
@@ -2812,7 +2823,7 @@ const messageSlice = createSlice({
       state.refineCriteria = action.payload;
       // Re-derive filteredMessages now so the UI snaps to the new refine
       // without the caller needing a second dispatch.
-      state.filteredMessages = applyRefineCriteria(state.messages, action.payload);
+      state.filteredMessages = applyRefineCriteria(plain(state.messages), action.payload);
     },
     clearRefineCriteria: (state) => {
       state.refineCriteria = null;
@@ -2825,7 +2836,7 @@ const messageSlice = createSlice({
       const tab = state.threadTabs?.[action.payload.threadId];
       if (!tab) return;
       tab.refineCriteria = action.payload.criteria;
-      tab.filteredMessages = applyRefineCriteria(tab.messages, action.payload.criteria);
+      tab.filteredMessages = applyRefineCriteria(plain(tab.messages), action.payload.criteria);
     },
     clearThreadRefineCriteria: (state, action: PayloadAction<string>) => {
       const tab = state.threadTabs?.[action.payload];
@@ -2886,11 +2897,14 @@ const messageSlice = createSlice({
     ) => {
       const { messages: pageMessages, totalCount, searchOffset } = action.payload;
       if (pageMessages.length === 0) return;
-      const existingIds = new Set(state.messages.map((m) => m.id));
+      const existing = plain(state.messages);
+      const existingIds = new Set(existing.map((m) => m.id));
       const fresh = pageMessages.filter((m) => !existingIds.has(m.id));
       if (fresh.length === 0) return;
-      const combined = [...state.messages, ...fresh];
-      const sorted = getSortedMessages(combined, state.order.order);
+      // #263: merge the page at the right end instead of re-sorting the
+      // whole list every page (quadratic at 30K). When no refine is active
+      // filteredMessages is the same array, not a copy.
+      const sorted = appendSortedPage(existing, fresh, state.order.order);
       state.messages = sorted;
       state.filteredMessages = applyRefineCriteria(sorted, state.refineCriteria);
       if (totalCount !== undefined) state.pagination.totalCount = totalCount;
@@ -2974,14 +2988,11 @@ const messageSlice = createSlice({
     ) => {
       const tab = state.threadTabs[action.payload.threadId];
       if (tab) {
-        const index = tab.selectedMessages.findIndex(
-          (msg: Message) => msg.id === action.payload.message.id
-        );
-        if (index >= 0) {
-          tab.selectedMessages.splice(index, 1);
-        } else {
-          tab.selectedMessages.push(action.payload.message);
-        }
+        const base = plain(tab.selectedMessages);
+        const index = base.findIndex((msg: Message) => msg.id === action.payload.message.id);
+        tab.selectedMessages = index >= 0
+          ? base.filter((_, i) => i !== index)
+          : [...base, action.payload.message];
       }
     },
     selectAllThreadMessages: (state, action: PayloadAction<string>) => {
@@ -3119,9 +3130,9 @@ const messageSlice = createSlice({
       .addCase(deleteMessage.fulfilled, (state, action) => {
         const messageId = action.payload;
         const container = getActiveContainer(state);
-        container.messages = container.messages.filter((m) => m.id !== messageId);
-        container.filteredMessages = container.filteredMessages.filter((m) => m.id !== messageId);
-        container.selectedMessages = container.selectedMessages.filter((m) => m.id !== messageId);
+        container.messages = plain(container.messages).filter((m) => m.id !== messageId);
+        container.filteredMessages = plain(container.filteredMessages).filter((m) => m.id !== messageId);
+        container.selectedMessages = plain(container.selectedMessages).filter((m) => m.id !== messageId);
       })
       // Delete multiple messages
       .addCase(deleteMessages.pending, (state) => {
@@ -3173,8 +3184,11 @@ const messageSlice = createSlice({
         state.pagination.isLoadingAll = false;
         state.pagination.loadAllProgress = null;
 
-        state.messages = getSortedMessages(state.messages, state.order.order);
-        state.filteredMessages = applyRefineCriteria(state.messages, state.refineCriteria);
+        // #263: pages were merged in order, so this is only a defensive
+        // pass, done on the plain array rather than the draft.
+        const finalSorted = getSortedMessages(plain(state.messages), state.order.order);
+        state.messages = finalSorted;
+        state.filteredMessages = applyRefineCriteria(finalSorted, state.refineCriteria);
         state.selectedMessages = [];
 
         state.pagination.lastMessageId = action.payload.lastMessageId;
@@ -3259,12 +3273,12 @@ const messageSlice = createSlice({
       .addCase(fetchNextSearchPage.fulfilled, (state, action) => {
         state.pagination.isLoadingMore = false;
 
-        const existingIds = new Set(state.messages.map((m) => m.id));
+        const existing = plain(state.messages);
+        const existingIds = new Set(existing.map((m) => m.id));
         const newMessages = action.payload.messages.filter(
           (m) => !existingIds.has(m.id)
         );
-        const combined = [...state.messages, ...newMessages];
-        const sorted = getSortedMessages(combined, state.order.order);
+        const sorted = appendSortedPage(existing, newMessages, state.order.order);
         state.messages = sorted;
         state.filteredMessages = applyRefineCriteria(sorted, state.refineCriteria);
 
@@ -3293,8 +3307,11 @@ const messageSlice = createSlice({
         state.pagination.isLoadingAll = false;
         state.pagination.loadAllProgress = null;
 
-        state.messages = getSortedMessages(state.messages, state.order.order);
-        state.filteredMessages = applyRefineCriteria(state.messages, state.refineCriteria);
+        // #263: pages were merged in order, so this is only a defensive
+        // pass, done on the plain array rather than the draft.
+        const finalSorted = getSortedMessages(plain(state.messages), state.order.order);
+        state.messages = finalSorted;
+        state.filteredMessages = applyRefineCriteria(finalSorted, state.refineCriteria);
 
         state.pagination.totalCount = action.payload.totalResults;
         state.pagination.hasMore = false;
@@ -3473,9 +3490,9 @@ const messageSlice = createSlice({
         const { messageId, deleted, updatedMessage } = action.payload;
         const container = getActiveContainer(state);
         if (deleted) {
-          container.messages = container.messages.filter((m) => m.id !== messageId);
-          container.filteredMessages = container.filteredMessages.filter((m) => m.id !== messageId);
-          container.selectedMessages = container.selectedMessages.filter((m) => m.id !== messageId);
+          container.messages = plain(container.messages).filter((m) => m.id !== messageId);
+          container.filteredMessages = plain(container.filteredMessages).filter((m) => m.id !== messageId);
+          container.selectedMessages = plain(container.selectedMessages).filter((m) => m.id !== messageId);
         } else if (updatedMessage) {
           const updateInArray = (arr: Message[]) =>
             arr.map((m) => (m.id === messageId ? updatedMessage : m));
@@ -3489,9 +3506,9 @@ const messageSlice = createSlice({
         const { messageId, deleted, updatedMessage } = action.payload;
         const container = getActiveContainer(state);
         if (deleted) {
-          container.messages = container.messages.filter((m) => m.id !== messageId);
-          container.filteredMessages = container.filteredMessages.filter((m) => m.id !== messageId);
-          container.selectedMessages = container.selectedMessages.filter((m) => m.id !== messageId);
+          container.messages = plain(container.messages).filter((m) => m.id !== messageId);
+          container.filteredMessages = plain(container.filteredMessages).filter((m) => m.id !== messageId);
+          container.selectedMessages = plain(container.selectedMessages).filter((m) => m.id !== messageId);
         } else if (updatedMessage) {
           const updateInArray = (arr: Message[]) =>
             arr.map((m) => (m.id === messageId ? updatedMessage : m));

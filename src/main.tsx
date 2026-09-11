@@ -30,6 +30,25 @@ if (import.meta.env.DEV) {
   (window as any).__store__ = store;
 }
 
+// #263: measurement hooks for tooling/perf. Only a build made with
+// VITE_PERF_HOOKS=true gets them (never a store or hosted build), so the
+// loaded-set harness can drive a production bundle the way a user does.
+if (import.meta.env.VITE_PERF_HOOKS === 'true') {
+  (window as any).__store__ = store;
+  Promise.all([import('./features/auth/authSlice'), import('./features/message/messageSlice')]).then(
+    ([auth, message]) => {
+      (window as any).__perfThunks__ = {
+        authenticateWithToken: auth.authenticateWithToken,
+        fetchMessages: message.fetchMessages,
+        fetchAllMessages: message.fetchAllMessages,
+        deleteMessages: message.deleteMessages,
+        selectAllMessages: message.selectAllMessages,
+        toggleMessageSelection: message.toggleMessageSelection,
+      };
+    },
+  );
+}
+
 // Register service worker for streaming downloads in web-app mode
 if ('serviceWorker' in navigator && !(typeof chrome !== 'undefined' && chrome.runtime?.id)) {
   navigator.serviceWorker.register('/sw.js');

@@ -39,10 +39,10 @@ import { selectCachedUserMap } from '@features/cache/cacheSlice';
 import { selectIsHeavyOperationRunning } from '@features/app/operationSelectors';
 import { DiscrubSetting } from 'discrub-core/discrub-enum';
 import type { Channel } from 'discrub-core/types/discord-types';
+import { overlayMessageAuthors } from '@/utils/messageAuthorOverlay';
 import {
   selectActiveFilteredMessages,
   selectClearSeq,
-  selectActiveSelectedMessages,
   selectActiveMessages,
   selectActiveLoading,
   selectActiveError,
@@ -133,7 +133,6 @@ const ServerView = ({ onStartShellTour }: ServerViewProps) => {
   const allMessages = useAppSelector(selectActiveMessages);
   const messages = useAppSelector(selectActiveFilteredMessages);
   const clearSeq = useAppSelector(selectClearSeq);
-  const selectedMessages = useAppSelector(selectActiveSelectedMessages);
   const isLoading = useAppSelector(selectActiveLoading);
   const error = useAppSelector(selectActiveError);
   const loadAllCancelled = useAppSelector(selectActiveLoadAllCancelled);
@@ -378,16 +377,9 @@ const ServerView = ({ onStartShellTour }: ServerViewProps) => {
       };
     });
 
-    // Overlay message author data
-    allMessages.forEach((msg) => {
-      if (msg.author) {
-        map[msg.author.id] = {
-          ...map[msg.author.id],
-          userName: msg.author.username,
-          displayName: msg.author.global_name || map[msg.author.id]?.displayName,
-        };
-      }
-    });
+    // Overlay message author data (#263: skips authors already recorded
+    // unchanged, since this runs on every Load All page and delete flush).
+    overlayMessageAuthors(map, allMessages);
 
     return map;
   }, [allMessages, cachedUserMap, selectedGuild?.id]);
@@ -1106,7 +1098,6 @@ const ServerView = ({ onStartShellTour }: ServerViewProps) => {
 
       {!isForumChannel && (
         <MessageActions
-          selectedMessages={selectedMessages}
           onDelete={handleDelete}
           onEdit={handleEdit}
           onBulkEdit={handleBulkEdit}
