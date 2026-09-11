@@ -57,6 +57,29 @@ describe('Settings', () => {
     });
   });
 
+  // #265: the retry wait slider, 1s to 30s, doubles per retry.
+  it('lets the retry wait reach 12s, shows the doubled schedule, and persists it', () => {
+    cy.get('[aria-label="Settings"]').click();
+    // The retry slider sits below the three delay sliders, past the dialog's fold.
+    cy.get('[role="dialog"] [data-testid="retry-wait-schedule"]').scrollIntoView()
+      .should('have.text', 'Retries wait: 1s, 2s, 4s, 8s, 16s');
+    cy.get('[role="dialog"] input[type="range"]')
+      .eq(3)
+      .should('have.attr', 'aria-valuemax', '30')
+      .should('have.attr', 'aria-valuemin', '1')
+      .then(($input) => {
+        const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf($input[0]), 'value')!.set!;
+        setter.call($input[0], '12');
+        $input[0].dispatchEvent(new Event('input', { bubbles: true }));
+      });
+    cy.get('[role="dialog"] [data-testid="retry-wait-schedule"]').should('have.text', 'Retries wait: 12s, 24s, 48s, 96s, 192s');
+    cy.get('[role="dialog"]').contains('button', 'Save Settings').click();
+    cy.window().its('__store__').invoke('getState').its('app.settings.retryWait').should('eq', '12.0');
+    cy.readIdbStore('settings').then((values) => {
+      expect(values).to.include('12.0');
+    });
+  });
+
   it('shows rest breaks on by default and persists turning them off', () => {
     cy.get('[aria-label="Settings"]').click();
     // The switch sits below the three sliders, past the dialog's fold.

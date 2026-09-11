@@ -13,7 +13,7 @@ import { userEnrichmentService } from '@services/userEnrichmentService';
 import { reactionEnrichmentService } from '@services/reactionEnrichmentService';
 import { replyEnrichmentService } from '@services/replyEnrichmentService';
 import { mergeCachedUserMap, addFailedUserId, saveCacheToLocalStorage } from '@features/cache/cacheSlice';
-import { waitWhilePaused, checkCancelled, cancellableDelay, withTransientRetry, isTransientApiFailure } from '@/utils/operationLoopUtils';
+import { waitWhilePaused, checkCancelled, cancellableDelay, withTransientRetry, isTransientApiFailure, transientRetryDelayMs, retryBaseDelayMs } from '@/utils/operationLoopUtils';
 import { addStatusEntry, showOperationTip, showToast } from '@features/status/statusSlice';
 import { getEmojiKey } from '@/utils/emojiUtils';
 import { applyRefineCriteria, criteriaIsActive, type RefineCriteria } from './messageFiltering';
@@ -1694,9 +1694,10 @@ export const loadAllSearchResults = createAsyncThunk(
             if (isTransientApiFailure({ success: false, status })) {
               transientRetries += 1;
               if (transientRetries <= 5) {
-                const delayMs = Math.min(
-                  1000 * Math.pow(2, transientRetries - 1),
-                  30000
+                // #265: same curve as withTransientRetry, from the Retry wait setting.
+                const delayMs = transientRetryDelayMs(
+                  transientRetries - 1,
+                  retryBaseDelayMs(getState as () => RootState),
                 );
                 dispatch(addStatusEntry({
                   level: 'warning',

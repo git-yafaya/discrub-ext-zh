@@ -194,7 +194,10 @@
     "zoneSafe": "Sicher",
     "intro": "Diese Verzögerungen verhindern Rate-Limit-Fehler von Discord. Die Standardwerte sind konservativ gewählt. Über 10 s liegt die sicherste Zone, gedacht für sehr lange Läufe wie komplette Serverexporte.",
     "restBreaks": "Ruhepausen",
-    "restBreaksHelp": "Nach jeweils {{active}} Minuten Aktivität {{minutes}} Minuten pausieren. Lange Läufe senden so weniger Anfragen pro Tag."
+    "restBreaksHelp": "Nach jeweils {{active}} Minuten Aktivität {{minutes}} Minuten pausieren. Lange Läufe senden so weniger Anfragen pro Tag.",
+    "retryWait": "Wartezeit vor Wiederholung",
+    "retryWaitHelp": "Wartezeit vor dem ersten neuen Versuch, wenn eine Anfrage fehlschlägt. Jeder weitere Versuch wartet doppelt so lange, danach pausiert der Vorgang.",
+    "retryWaitSchedule": "Wartezeiten der Versuche: {{schedule}}"
   },
   "exportPrefs": {
     "intro": "Das sind Standardwerte. Im Exportdialog kannst du sie pro Export überschreiben.",

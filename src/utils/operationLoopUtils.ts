@@ -1,5 +1,5 @@
 import type { RootState } from '@/app/store';
-import { selectDiscrubPaused, selectDiscrubCancelled } from '@features/app/appSlice';
+import { selectDiscrubPaused, selectDiscrubCancelled, selectRetryWaitSeconds } from '@features/app/appSlice';
 import { throttleImmuneSleep } from './workerTimers';
 
 /**
@@ -157,13 +157,33 @@ export const ONLINE_NETWORK_RETRIES = 2;
 export const isBrowserOnline = (): boolean =>
   typeof navigator === 'undefined' || navigator.onLine !== false;
 
+/** Retries in a transient-retry run (the wait doubles this many times, less one). */
+export const TRANSIENT_RETRIES = 5;
+
+/**
+ * #265: the wait before retry number `attempt + 1`, in ms. The wait doubles
+ * per retry from `baseDelayMs` (the Retry wait setting) and is capped at
+ * the last step of a full run, so the default 1 s setting still gives
+ * 1, 2, 4, 8, 16 s and a 30 s setting gives 30, 60, 120, 240, 480 s.
+ */
+export const transientRetryDelayMs = (attempt: number, baseDelayMs: number, maxDelayMs?: number): number => {
+  const cap = maxDelayMs ?? baseDelayMs * Math.pow(2, TRANSIENT_RETRIES - 1);
+  return Math.min(baseDelayMs * Math.pow(2, attempt), cap);
+};
+
+/** The Retry wait setting in ms, read from state. */
+export const retryBaseDelayMs = (getState: () => RootState): number =>
+  selectRetryWaitSeconds(getState()) * 1000;
+
 export const withTransientRetry = async <T extends RetryableResponse>(
   fn: () => Promise<T>,
   opts: TransientRetryOptions<T>,
 ): Promise<T> => {
-  const maxRetries = opts.maxRetries ?? 5;
-  const baseDelayMs = opts.baseDelayMs ?? 1000;
-  const maxDelayMs = opts.maxDelayMs ?? 30000;
+  const maxRetries = opts.maxRetries ?? TRANSIENT_RETRIES;
+  // #265: the first wait comes from the Retry wait setting unless the
+  // caller pins it; the cap follows the base so the curve keeps its shape.
+  const baseDelayMs = opts.baseDelayMs ?? retryBaseDelayMs(opts.getState);
+  const maxDelayMs = opts.maxDelayMs;
   const shouldRetry = opts.shouldRetry ?? isTransientApiFailure;
 
   let lastResponse: T = { success: false } as T;
@@ -177,7 +197,7 @@ export const withTransientRetry = async <T extends RetryableResponse>(
     // don't announce a retry that will never happen.
     if (opts.signal?.aborted || checkCancelled(opts.getState)) return lastResponse;
 
-    const delayMs = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
+    const delayMs = transientRetryDelayMs(attempt, baseDelayMs, maxDelayMs);
     opts.onRetry?.(attempt + 1, delayMs, lastResponse);
     const cancelled = await cancellableDelay(delayMs, opts.getState, opts.signal);
     if (cancelled) return lastResponse;

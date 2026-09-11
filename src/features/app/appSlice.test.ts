@@ -8,6 +8,7 @@ import appReducer, {
   selectRequestsRefusedStopped,
   selectRestBreakUntil,
   selectRestBreaksEnabled,
+  selectRetryWaitSeconds,
   selectRateLimitStopped,
   setDiscrubPaused,
   setDiscrubCancelled,
@@ -836,6 +837,25 @@ describe('appSlice', () => {
       expect(selectRestBreaksEnabled(store.getState())).toBe(true);
       store.dispatch(setSettings({ ...defaultSettings, [DiscrubSetting.REST_BREAKS]: 'false' }));
       expect(selectRestBreaksEnabled(store.getState())).toBe(false);
+    });
+  });
+
+  describe('retry wait (#265)', () => {
+    it('defaults to 1 second and reads the setting', () => {
+      const store = createTestStore({ app: appReducer });
+      expect(selectRetryWaitSeconds(store.getState())).toBe(1);
+      store.dispatch(setSettings({ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: '7' }));
+      expect(selectRetryWaitSeconds(store.getState())).toBe(7);
+    });
+
+    it('clamps out-of-range values and falls back on garbage', () => {
+      const store = createTestStore({ app: appReducer });
+      store.dispatch(setSettings({ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: '0' }));
+      expect(selectRetryWaitSeconds(store.getState())).toBe(1);
+      store.dispatch(setSettings({ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: '900' }));
+      expect(selectRetryWaitSeconds(store.getState())).toBe(30);
+      store.dispatch(setSettings({ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: 'abc' }));
+      expect(selectRetryWaitSeconds(store.getState())).toBe(1);
     });
   });
 

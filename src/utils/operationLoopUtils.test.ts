@@ -6,9 +6,9 @@ import {
   withTransientRetry,
   isTransientApiFailure,
   isBrowserOnline,
-  ONLINE_NETWORK_RETRIES,
-} from './operationLoopUtils';
+  ONLINE_NETWORK_RETRIES, transientRetryDelayMs } from './operationLoopUtils';
 import type { RootState } from '@/app/store';
+import { DiscrubSetting } from 'discrub-core/discrub-enum';
 import { initialAppState } from '@features/app/appTypes';
 
 function createMockGetState(overrides: Partial<RootState['app']> = {}): () => RootState {
@@ -288,6 +288,40 @@ describe('withTransientRetry', () => {
     // And the attempt counters track in step (1-indexed by design).
     const attempts = onRetry.mock.calls.map((c) => c[0]);
     expect(attempts).toEqual([1, 2, 3, 4]);
+  });
+});
+
+describe('retry wait setting (#265)', () => {
+  it('transientRetryDelayMs doubles from the base and caps at the fifth step', () => {
+    expect([0, 1, 2, 3, 4, 5].map((a) => transientRetryDelayMs(a, 1000))).toEqual([1000, 2000, 4000, 8000, 16000, 16000]);
+    expect([0, 1, 2, 3, 4].map((a) => transientRetryDelayMs(a, 30000))).toEqual([30000, 60000, 120000, 240000, 480000]);
+    expect(transientRetryDelayMs(3, 1000, 50)).toBe(50);
+  });
+
+  it('withTransientRetry takes its first wait from the Retry wait setting', async () => {
+    const getState = createMockGetState({
+      settings: { ...initialAppState.settings, [DiscrubSetting.RETRY_WAIT]: '3' } as any,
+    });
+    const fn = vi.fn().mockResolvedValue({ success: false, status: 500 });
+    const onRetry = vi.fn();
+    vi.useFakeTimers();
+    const run = withTransientRetry(fn, { getState, onRetry, maxRetries: 2 });
+    await vi.runAllTimersAsync();
+    await run;
+    vi.useRealTimers();
+    expect(onRetry.mock.calls.map((c) => c[1])).toEqual([3000, 6000]);
+  });
+
+  it('withTransientRetry keeps the 1, 2, 4, 8, 16 second curve at the default setting', async () => {
+    const getState = createMockGetState();
+    const fn = vi.fn().mockResolvedValue({ success: false, status: 500 });
+    const onRetry = vi.fn();
+    vi.useFakeTimers();
+    const run = withTransientRetry(fn, { getState, onRetry });
+    await vi.runAllTimersAsync();
+    await run;
+    vi.useRealTimers();
+    expect(onRetry.mock.calls.map((c) => c[1])).toEqual([1000, 2000, 4000, 8000, 16000]);
   });
 });
 

@@ -247,7 +247,7 @@ Settings are split across tabs:
 
 - **Display**: language (English or German; a fresh install follows your browser, and the sign-in screen has a one-word Deutsch / English link), date and time format, DM list order (most recent first, alphabetical, or Discord's own order)
 - **User Data**: display name and nickname lookup toggles, reaction enrichment, user data refresh rate
-- **Operation Delays**: search and delete delays with a randomization modifier (with a `?` explainer on Discord rate limits), plus rest breaks: after 45 minutes of activity a long operation pauses for 10 minutes on its own (on by default)
+- **Operation Delays**: search and delete delays with a randomization modifier (with a `?` explainer on Discord rate limits), plus rest breaks: after 45 minutes of activity a long operation pauses for 10 minutes on its own (on by default), and a retry wait: how long to wait before the first retry when a request fails, doubling each retry (1 second by default, up to 30)
 - **Export Preferences**: default format, template, media types and all export options
 - **Purge Behavior**: default mode (Delete, Strip Attachments Only, Remove Reactions) and media retention
 

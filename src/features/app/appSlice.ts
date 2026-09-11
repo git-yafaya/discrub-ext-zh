@@ -286,6 +286,21 @@ export const selectSearchDelay = (state: RootState) =>
 export const selectDeleteDelay = (state: RootState) =>
   parseFloat(state.app.settings?.[DiscrubSetting.DELETE_DELAY] ?? defaultSettings[DiscrubSetting.DELETE_DELAY]);
 
+/** Retry wait bounds in seconds (#265): the first wait after a failed request. */
+export const RETRY_WAIT_MIN_SECONDS = 1;
+export const RETRY_WAIT_MAX_SECONDS = 30;
+
+/**
+ * #265: seconds to wait before the first retry of a failed request. Each
+ * retry doubles it. Out-of-range or unparsable values fall back to the
+ * default so a bad stored value cannot make retries instant or endless.
+ */
+export const selectRetryWaitSeconds = (state: RootState) => {
+  const raw = parseFloat(state.app.settings?.[DiscrubSetting.RETRY_WAIT] ?? defaultSettings[DiscrubSetting.RETRY_WAIT]);
+  if (!Number.isFinite(raw)) return parseFloat(defaultSettings[DiscrubSetting.RETRY_WAIT]);
+  return Math.min(RETRY_WAIT_MAX_SECONDS, Math.max(RETRY_WAIT_MIN_SECONDS, raw));
+};
+
 export const selectDelayModifier = (state: RootState) =>
   parseFloat(state.app.settings?.[DiscrubSetting.DELAY_MODIFIER] ?? defaultSettings[DiscrubSetting.DELAY_MODIFIER]);
 

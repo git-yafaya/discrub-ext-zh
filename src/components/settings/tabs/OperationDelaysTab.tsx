@@ -1,5 +1,7 @@
 import { Box, Slider, Typography, Alert, Stack, Switch, useTheme } from '@mui/material';
 import { REST_BREAK_AFTER_MS, REST_BREAK_LENGTH_MS } from '@/hooks/useRestBreaks';
+import { RETRY_WAIT_MIN_SECONDS, RETRY_WAIT_MAX_SECONDS } from '@features/app/appSlice';
+import { TRANSIENT_RETRIES, transientRetryDelayMs } from '@/utils/operationLoopUtils';
 import type { AppSettings } from 'discrub-core/types/discrub-types';
 import { DiscrubSetting } from 'discrub-core/discrub-enum';
 import TourFootnote from '@components/welcome/TourFootnote';
@@ -78,6 +80,20 @@ const DELETE_CONFIG: DelaySliderConfig = {
   recommendedMin: 2, recommendedMax: 4,
   safest: SAFEST_ZONE,
 };
+
+/** #265: the first wait after a failed request; each retry doubles it. */
+const RETRY_CONFIG: DelaySliderConfig = {
+  key: DiscrubSetting.RETRY_WAIT,
+  labelKey: 'delays.retryWait',
+  descriptionKey: 'delays.retryWaitHelp',
+  min: RETRY_WAIT_MIN_SECONDS, max: RETRY_WAIT_MAX_SECONDS, step: 1,
+  recommendedMin: RETRY_WAIT_MIN_SECONDS, recommendedMax: 5,
+};
+
+/** "1s, 2s, 4s, 8s, 16s" for a given first wait. */
+export const retrySchedule = (firstWaitSeconds: number): string =>
+  Array.from({ length: TRANSIENT_RETRIES }, (_, i) =>
+    `${Math.round(transientRetryDelayMs(i, firstWaitSeconds * 1000) / 1000)}s`).join(', ');
 
 const MODIFIER_CONFIG: DelaySliderConfig = {
   key: DiscrubSetting.DELAY_MODIFIER,
@@ -224,6 +240,10 @@ export const OperationDelaysTab = ({ formValues, onChange }: OperationDelaysTabP
   const deleteDelay = parseFloat(formValues[DiscrubSetting.DELETE_DELAY]) || 0;
   const modifier = parseFloat(formValues[DiscrubSetting.DELAY_MODIFIER]) || 0;
   const restBreaks = formValues[DiscrubSetting.REST_BREAKS] !== 'false';
+  const retryWait = Math.min(
+    RETRY_WAIT_MAX_SECONDS,
+    Math.max(RETRY_WAIT_MIN_SECONDS, parseFloat(formValues[DiscrubSetting.RETRY_WAIT]) || RETRY_WAIT_MIN_SECONDS),
+  );
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -245,6 +265,11 @@ export const OperationDelaysTab = ({ formValues, onChange }: OperationDelaysTabP
       </Typography>
 
       <DelaySlider config={MODIFIER_CONFIG} value={modifier} onChange={onChange} />
+
+      <DelaySlider config={RETRY_CONFIG} value={retryWait} onChange={onChange} />
+      <Typography variant="caption" color="text.secondary" sx={{ mt: -2 }} data-testid="retry-wait-schedule">
+        {t('delays.retryWaitSchedule', { schedule: retrySchedule(retryWait) })}
+      </Typography>
 
       <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2}>
         <Box>

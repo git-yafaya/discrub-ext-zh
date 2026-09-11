@@ -63,6 +63,7 @@ export const defaultSettings: AppSettings = {
   [DiscrubSetting.APP_LANGUAGE]: '',
   // Pause long operations for a rest break on a fixed cadence (useRestBreaks).
   [DiscrubSetting.REST_BREAKS]: 'true',
+  [DiscrubSetting.RETRY_WAIT]: '1',
 
   // Purge Behavior
   [DiscrubSetting.PURGE_RETAIN_ATTACHED_MEDIA]: 'false',

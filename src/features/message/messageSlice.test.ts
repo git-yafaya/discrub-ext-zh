@@ -6934,6 +6934,36 @@ describe('messageSlice', () => {
         expect(retryEntries).toHaveLength(1);
       });
 
+      it('waits the Retry wait setting before the first retry (#265)', async () => {
+        const page = createMockMessages(25);
+        vi.mocked(discordService.getDiscordService).mockReturnValue(makeSearchService({
+          fetchSearchMessageData: vi
+            .fn()
+            .mockResolvedValueOnce({ success: false, status: 502 })
+            .mockResolvedValueOnce({ success: false, status: 502 })
+            .mockResolvedValueOnce({ success: true, data: { messages: [page], total_results: 25 } })
+            .mockResolvedValue({ success: true, data: { messages: [[]], total_results: 25 } }),
+        } as any));
+        vi.mocked(addStatusEntry).mockClear();
+
+        const { store } = await buildStore(seedSearchActive());
+        const { setSettings, defaultSettings } = await import('@features/app/appSlice');
+        const { DiscrubSetting } = await import('discrub-core/discrub-enum');
+        store.dispatch(setSettings({ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: '2' }));
+        const result = await store.dispatch(
+          loadAllSearchResults({ channelId: 'ch-1', token: 'token' }),
+        );
+
+        expect(result.type).toBe('message/loadAllSearchResults/fulfilled');
+        const retryMessages = vi.mocked(addStatusEntry).mock.calls
+          .map(([p]) => p.message)
+          .filter((m) => /Search Load All: connection failed, retrying/.test(m));
+        expect(retryMessages).toEqual([
+          'Search Load All: connection failed, retrying in 2s (attempt 1/5)',
+          'Search Load All: connection failed, retrying in 4s (attempt 2/5)',
+        ]);
+      });
+
       it('pauses the operation after retries are exhausted, preserves partial progress', async () => {
         const { waitWhilePaused, checkCancelled } = await import('@/utils/operationLoopUtils');
         vi.mocked(checkCancelled).mockImplementation(

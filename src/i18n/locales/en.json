@@ -194,7 +194,10 @@
     "zoneSafe": "Safe",
     "intro": "These delays prevent Discord rate-limit errors. Defaults are tuned conservatively. Above 10s is the Safest zone, meant for very long runs such as full-server exports.",
     "restBreaks": "Rest breaks",
-    "restBreaksHelp": "Pause for {{minutes}} minutes after every {{active}} minutes of activity. Long runs send fewer requests per day."
+    "restBreaksHelp": "Pause for {{minutes}} minutes after every {{active}} minutes of activity. Long runs send fewer requests per day.",
+    "retryWait": "Retry Wait",
+    "retryWaitHelp": "Wait before the first retry when a request fails. Each retry waits twice as long, then the operation pauses for you.",
+    "retryWaitSchedule": "Retries wait: {{schedule}}"
   },
   "exportPrefs": {
     "intro": "These are defaults. Override per-export in the export dialog.",

@@ -7,6 +7,7 @@ import {
   buildRailGradient,
   secondsToSlider,
   sliderToSeconds,
+  retrySchedule,
   type DelaySliderConfig,
 } from './OperationDelaysTab';
 
@@ -25,10 +26,40 @@ import { DiscrubSetting } from 'discrub-core/discrub-enum';
 // Use getAllByText and check length >= 1 for label presence, or query by role.
 
 describe('OperationDelaysTab', () => {
-  it('should render three sliders for delays', () => {
+  it('should render four sliders: search, delete, modifier, retry wait', () => {
     render(<OperationDelaysTab formValues={defaultSettings} onChange={vi.fn()} />);
     const sliders = screen.getAllByRole('slider');
-    expect(sliders.length).toBe(3);
+    expect(sliders.length).toBe(4);
+  });
+
+  // #265: the retry wait slider and its schedule caption.
+  it('shows the retry wait at 1s by default with the 1, 2, 4, 8, 16 schedule', () => {
+    render(<OperationDelaysTab formValues={defaultSettings} onChange={vi.fn()} />);
+    expect(screen.getByText('Retry Wait')).toBeInTheDocument();
+    expect(screen.getByTestId('retry-wait-schedule')).toHaveTextContent('Retries wait: 1s, 2s, 4s, 8s, 16s');
+    expect(screen.getAllByRole('slider')[3]).toHaveAttribute('aria-valuenow', '1');
+  });
+
+  it('shows the doubled schedule for a stored retry wait and clamps a bad value', () => {
+    const { unmount } = render(
+      <OperationDelaysTab formValues={{ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: '5' }} onChange={vi.fn()} />,
+    );
+    expect(screen.getByTestId('retry-wait-schedule')).toHaveTextContent('Retries wait: 5s, 10s, 20s, 40s, 80s');
+    unmount();
+    render(<OperationDelaysTab formValues={{ ...defaultSettings, [DiscrubSetting.RETRY_WAIT]: '0' }} onChange={vi.fn()} />);
+    expect(screen.getAllByRole('slider')[3]).toHaveAttribute('aria-valuenow', '1');
+  });
+
+  it('reports a retry wait change under the RETRY_WAIT key as whole seconds', () => {
+    const onChange = vi.fn();
+    render(<OperationDelaysTab formValues={defaultSettings} onChange={onChange} />);
+    const slider = screen.getAllByRole('slider')[3];
+    fireEvent.change(slider, { target: { value: '12' } });
+    expect(onChange).toHaveBeenCalledWith(DiscrubSetting.RETRY_WAIT, '12.0');
+  });
+
+  it('retrySchedule caps the last step at the fifth doubling', () => {
+    expect(retrySchedule(30)).toBe('30s, 60s, 120s, 240s, 480s');
   });
 
   it('renders the rest-breaks switch on by default and reports a toggle as "false"', () => {
@@ -153,7 +184,7 @@ describe('OperationDelaysTab', () => {
     it('extends the search and delete sliders to 30s but leaves the modifier at 5s', () => {
       render(<OperationDelaysTab formValues={defaultSettings} onChange={vi.fn()} />);
       const maxes = screen.getAllByRole('slider').map((el) => el.getAttribute('aria-valuemax'));
-      expect(maxes).toEqual(['30', '30', '5']);
+      expect(maxes).toEqual(['30', '30', '5', '30']);
     });
 
     it('reports the slider position in seconds after the compressed stretch', () => {
