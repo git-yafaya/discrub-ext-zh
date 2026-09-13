@@ -67,7 +67,7 @@ To select many messages, click a checkbox and drag (the feed scrolls at the edge
 
 **Filters** has two layers in one modal:
 
-- **Search** calls Discord's API. Filter by content (one term, or several matched any-of: type a term and press Enter, or separate terms with commas), author, mentions, has-types (image, video, link, file, embed, sound, sticker, snapshot, poll, forward), attachment file type (png, pdf, any list of extensions), exact attachment file name, date range (before, after, or between two dates) with time-of-day precision, pinned status, and author type (human, bot, webhook). Results load as you scroll, the channel header shows `X of Y matches loaded`, and Load All continues past Discord's 5,000-result cap. Load All renders pages as they arrive, retries transient network failures with backoff, and pauses if retries run out so you can Resume. If Discord reports that a channel's search index is still being built, Discrub says so.
+- **Search** calls Discord's API. Filter by content (one term, or several matched any-of: type a term and press Enter, or separate terms with commas), author, mentions, has-types (image, video, link, file, embed, sound, sticker, snapshot, poll, forward), attachment file type (png, pdf, any list of extensions), exact attachment file name, date range (before, after, or between two dates) with time-of-day precision, pinned status, and author type (human, bot, webhook). Results load as you scroll, the channel header shows `X of Y matches loaded`, and Load All continues past Discord's 5,000-result cap. Load All renders pages as they arrive, retries transient network failures with backoff, and pauses if retries run out so you can Resume. If Discord reports that a channel's search index is still being built, Discrub waits and tries the page again, and a page that comes back short does not end Load All early.
 - **Refine** narrows the loaded messages locally with no API calls. Content terms match any-of here too. It keeps applying after Load more, and a status entry appears when a new page matched nothing. It has a system-message control to **show only** or **hide** a chosen type (pins, joins, boosts), plus attachment file type and partial file-name match.
 
 Search and Refine criteria clear when you switch to another channel or DM.
@@ -270,7 +270,7 @@ All long operations (export, purge, load all, delete, edit, reaction removal) su
 
 Controls appear in the status bar while an operation runs. In Focus Mode, or anywhere the status panel is hidden, a floating pause control appears during heavy operations, and the `Space` hotkey still works.
 
-A dropped connection does not end a run. Exports, purge scans, thread Load All and package rehydration retry a failed page fetch with backoff (network errors and server 5xx only; a 4xx is final). Exports and Load All pause when the retries run out so you can fix the network and Resume from the same page. A purge scan that still cannot continue says so in the status log instead of finishing as if it had covered everything.
+A dropped connection does not end a run. Exports, purge scans, thread Load All and package rehydration retry a failed page fetch with backoff (network errors and server 5xx only; a 4xx is final). Exports and Load All pause when the retries run out so you can fix the network and Resume from the same page, and the status log says what Discord answered on each retry. A purge scan that still cannot continue says so in the status log instead of finishing as if it had covered everything.
 
 ### Themes
 

@@ -122,10 +122,10 @@ Discrub 2.0 is the next major version. These features were not in Discrub Classi
 | Content Terms | One term | Several terms matched any-of, in both Search (one Discord search per term, merged) and Refine |
 | Attachment Filters | No | Filter by attachment file type and file name, server-side in Search and locally in Refine |
 | Date Precision | Whole days | Hour and minute, with Before, After, or Between two dates |
-| Pagination | All at once | 25-message pages with "X of Y matches loaded" counter; Load All renders pages live and retries transient network failures |
+| Pagination | All at once | 25-message pages with "X of Y matches loaded" counter; Load All renders pages live, retries transient network failures, and keeps paging past a short page |
 | Inline Filter-by-User | No | Click an author, then filter by them or messages mentioning them |
 | Filter Lifetime | Criteria persisted across channel switches | Cleared when you switch conversations |
-| Indexing Notice | No | Warns when Discord reports a channel's search index is still being built |
+| Indexing Notice | No | When Discord reports a channel's search index is still being built, waits and tries the page again instead of stopping |
 
 ---
 
