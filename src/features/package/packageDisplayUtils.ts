@@ -1,5 +1,6 @@
 import {
   PACKAGE_CHANNEL_TYPE,
+  THREAD_CHANNEL_TYPES,
   type PackageChannel,
 } from './packageTypes';
 
@@ -12,21 +13,35 @@ export type PackageChannelCategory =
   | 'thread'
   | 'dm'
   | 'groupDm'
-  | 'orphan';
+  | 'orphan'
+  | 'unknown';
+
+/** Every category, in sidebar order. */
+export const PACKAGE_CHANNEL_CATEGORIES: readonly PackageChannelCategory[] = [
+  'guildText',
+  'thread',
+  'dm',
+  'groupDm',
+  'orphan',
+  'unknown',
+];
 
 export function getPackageChannelCategory(
   channel: PackageChannel,
 ): PackageChannelCategory {
   if (channel.isOrphan) return 'orphan';
+  if (THREAD_CHANNEL_TYPES.has(channel.type)) return 'thread';
   switch (channel.type) {
     case PACKAGE_CHANNEL_TYPE.DM:
       return 'dm';
     case PACKAGE_CHANNEL_TYPE.GROUP_DM:
       return 'groupDm';
-    case PACKAGE_CHANNEL_TYPE.GUILD_PUBLIC_THREAD:
-      return 'thread';
-    default:
+    case PACKAGE_CHANNEL_TYPE.GUILD_TEXT:
+    case PACKAGE_CHANNEL_TYPE.GUILD_FORUM:
       return 'guildText';
+    default:
+      // #270: a type Discrub could neither read nor infer.
+      return 'unknown';
   }
 }
 
@@ -77,7 +92,7 @@ export function getPackageChannelSubtitle(channel: PackageChannel): string {
   if (channel.guildName) return channel.guildName;
   if (channel.type === PACKAGE_CHANNEL_TYPE.DM) return 'Direct Message';
   if (channel.type === PACKAGE_CHANNEL_TYPE.GROUP_DM) return 'Group DM';
-  if (channel.type === PACKAGE_CHANNEL_TYPE.GUILD_PUBLIC_THREAD) return 'Thread';
+  if (THREAD_CHANNEL_TYPES.has(channel.type)) return 'Thread';
   return '';
 }
 

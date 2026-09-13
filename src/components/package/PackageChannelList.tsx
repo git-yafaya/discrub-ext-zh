@@ -72,6 +72,7 @@ const PackageChannelList = ({ filterText = '' }: PackageChannelListProps) => {
     dm: false,
     groupDm: false,
     orphan: true, // collapsed by default — less noise
+    unknown: false,
   });
 
   const filtered = useMemo(() => {
@@ -100,6 +101,7 @@ const PackageChannelList = ({ filterText = '' }: PackageChannelListProps) => {
       dm: [],
       groupDm: [],
       orphan: [],
+      unknown: [],
     };
     for (const c of filtered) {
       map[getPackageChannelCategory(c)].push(c);
@@ -132,6 +134,7 @@ const PackageChannelList = ({ filterText = '' }: PackageChannelListProps) => {
     { key: 'dm', label: t('package.sectionDms'), items: grouped.dm },
     { key: 'groupDm', label: t('package.sectionGroupDms'), items: grouped.groupDm },
     { key: 'orphan', label: t('package.sectionLeftServers'), items: grouped.orphan },
+    { key: 'unknown', label: t('package.sectionOther'), items: grouped.unknown },
   ];
 
   const totalShown = sections.reduce((n, s) => n + s.items.length, 0);
@@ -354,10 +357,17 @@ const ChannelIcon = ({ category }: { category: PackageChannelCategory }) => {
       return <ThreadIcon sx={ICON_SX} />;
     case 'orphan':
       return <ArchiveIcon sx={{ ...ICON_SX, color: 'warning.main' }} />;
+    case 'unknown':
+      return <UnknownChannelIcon sx={{ ...ICON_SX, color: 'text.disabled' }} />;
     case 'guildText':
-    default:
       return <TextChannelIcon sx={ICON_SX} />;
+    default:
+      return assertNever(category);
   }
 };
+
+function assertNever(value: never): never {
+  throw new Error(`Unhandled package channel category: ${String(value)}`);
+}
 
 export default PackageChannelList;

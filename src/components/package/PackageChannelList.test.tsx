@@ -92,3 +92,38 @@ describe('<PackageChannelList /> — #236 live remaining counts', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+
+describe('<PackageChannelList /> — sections per category (#270)', () => {
+  const mixed: ParsedPackage = {
+    ...parsed,
+    channels: [
+      { id: '1', type: PACKAGE_CHANNEL_TYPE.GUILD_TEXT, name: 'text-one', guildId: 'g1', guildName: 'Guild A', messageCount: 3, isOrphan: false },
+      { id: '2', type: PACKAGE_CHANNEL_TYPE.GUILD_PRIVATE_THREAD, name: 'thread-two', guildId: 'g1', guildName: 'Guild A', messageCount: 3, isOrphan: false },
+      { id: '3', type: PACKAGE_CHANNEL_TYPE.DM, name: 'Direct Message with dm-three#0', messageCount: 3, isOrphan: false },
+      { id: '4', type: PACKAGE_CHANNEL_TYPE.GROUP_DM, name: 'group-four', messageCount: 3, isOrphan: false },
+      { id: '5', type: PACKAGE_CHANNEL_TYPE.GUILD_TEXT, name: 'orphan-five', messageCount: 3, isOrphan: true },
+      { id: '6', type: PACKAGE_CHANNEL_TYPE.UNKNOWN, name: 'mystery-six', messageCount: 3, isOrphan: false },
+    ],
+    totalMessages: 18,
+  };
+
+  it('puts one channel of each type in its own section, unknown under Other', () => {
+    const state = statePackageLoaded() as any;
+    state.package.parsed = mixed;
+    renderWithProviders(<PackageChannelList />, { preloadedState: state });
+    expect(screen.getByText('Servers')).toBeInTheDocument();
+    expect(screen.getByText('Threads')).toBeInTheDocument();
+    expect(screen.getByText('Direct Messages')).toBeInTheDocument();
+    expect(screen.getByText('Group DMs')).toBeInTheDocument();
+    expect(screen.getByText('Left Servers')).toBeInTheDocument();
+    expect(screen.getByText('Other')).toBeInTheDocument();
+    expect(screen.getByText('mystery-six')).toBeInTheDocument();
+    expect(screen.getByText('thread-two')).toBeInTheDocument();
+  });
+
+  it('leaves the Other section out when nothing is unresolved', () => {
+    renderWithProviders(<PackageChannelList />, { preloadedState: statePackageLoaded() });
+    expect(screen.queryByText('Other')).not.toBeInTheDocument();
+  });
+});

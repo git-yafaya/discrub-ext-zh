@@ -138,4 +138,20 @@ describe('<PackageView /> — #236 live remaining counts', () => {
     // The scoped remaining total ignores the stale entry entirely.
     expect(screen.getByText('5 messages')).toBeInTheDocument();
   });
+
+  it('counts DMs the way the sidebar does: inferred DMs in, orphans out (#270)', () => {
+    const state = statePackageLoaded(null) as any;
+    state.package.parsed = {
+      ...parsed,
+      channels: [
+        channel,
+        { id: '300', type: 1, name: null, messageCount: 1, isOrphan: false, recipients: ['u1', 'x'] },
+        { id: '301', type: 3, name: null, messageCount: 1, isOrphan: false },
+        { id: '302', type: 1, name: null, messageCount: 1, isOrphan: true },
+        { id: '303', type: -1, name: 'mystery', messageCount: 1, isOrphan: false },
+      ],
+    };
+    renderWithProviders(<PackageView />, { preloadedState: state });
+    expect(screen.getByText('2 DMs')).toBeInTheDocument();
+  });
 });

@@ -108,6 +108,9 @@ const PackageAnalytics = () => {
             <TypeStat label={t('pkgAnalytics.dms')} value={typeBreakdown.dms} />
             <TypeStat label={t('pkgAnalytics.groupDms')} value={typeBreakdown.groupDms} />
             <TypeStat label={t('pkgAnalytics.threads')} value={typeBreakdown.threads} />
+            {typeBreakdown.other > 0 && (
+              <TypeStat label={t('pkgAnalytics.other')} value={typeBreakdown.other} />
+            )}
             <TypeStat label={t('pkgAnalytics.orphans')} value={typeBreakdown.orphans} tone="warning" />
           </Stack>
         </Section>

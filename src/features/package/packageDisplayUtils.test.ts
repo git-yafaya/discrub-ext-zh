@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   getPackageChannelLabel,
   getPackageChannelSubtitle,
+  getPackageChannelCategory,
+  PACKAGE_CHANNEL_CATEGORIES,
   stripLegacyDiscriminator,
 } from './packageDisplayUtils';
 import { PACKAGE_CHANNEL_TYPE, type PackageChannel } from './packageTypes';
@@ -110,5 +112,34 @@ describe('getPackageChannelSubtitle', () => {
         guildName: undefined,
       }),
     ).toBe('Direct Message');
+  });
+});
+
+
+describe('getPackageChannelCategory (#270)', () => {
+  it.each([
+    [PACKAGE_CHANNEL_TYPE.GUILD_TEXT, 'guildText'],
+    [PACKAGE_CHANNEL_TYPE.GUILD_FORUM, 'guildText'],
+    [PACKAGE_CHANNEL_TYPE.DM, 'dm'],
+    [PACKAGE_CHANNEL_TYPE.GROUP_DM, 'groupDm'],
+    [PACKAGE_CHANNEL_TYPE.GUILD_PUBLIC_THREAD, 'thread'],
+    [PACKAGE_CHANNEL_TYPE.GUILD_PRIVATE_THREAD, 'thread'],
+    [PACKAGE_CHANNEL_TYPE.GUILD_ANNOUNCEMENT_THREAD, 'thread'],
+    [PACKAGE_CHANNEL_TYPE.UNKNOWN, 'unknown'],
+  ])('maps type %p to %p', (type, category) => {
+    expect(getPackageChannelCategory({ ...base, type })).toBe(category);
+  });
+
+  it('puts orphans first, whatever their type', () => {
+    expect(getPackageChannelCategory({ ...base, type: PACKAGE_CHANNEL_TYPE.GUILD_FORUM, isOrphan: true })).toBe('orphan');
+  });
+
+  it('lists every category once, unknown last', () => {
+    expect(PACKAGE_CHANNEL_CATEGORIES[PACKAGE_CHANNEL_CATEGORIES.length - 1]).toBe('unknown');
+    expect(new Set(PACKAGE_CHANNEL_CATEGORIES).size).toBe(PACKAGE_CHANNEL_CATEGORIES.length);
+  });
+
+  it('subtitles every thread type as Thread', () => {
+    expect(getPackageChannelSubtitle({ ...base, name: 't', type: PACKAGE_CHANNEL_TYPE.GUILD_PRIVATE_THREAD })).toBe('Thread');
   });
 });

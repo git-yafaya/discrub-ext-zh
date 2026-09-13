@@ -96,7 +96,21 @@ describe('computeChannelTypeBreakdown', () => {
       makeChannel({ type: PACKAGE_CHANNEL_TYPE.GUILD_TEXT, isOrphan: true }),
     ];
     const out = computeChannelTypeBreakdown(channels);
-    expect(out).toEqual({ guildText: 2, dms: 1, groupDms: 1, threads: 1, orphans: 1 });
+    expect(out).toEqual({ guildText: 2, dms: 1, groupDms: 1, threads: 1, orphans: 1, other: 0 });
+  });
+
+  it('counts unresolved types under other and every thread type under threads (#270)', () => {
+    const channels = [
+      makeChannel({ type: PACKAGE_CHANNEL_TYPE.UNKNOWN }),
+      makeChannel({ type: PACKAGE_CHANNEL_TYPE.GUILD_PRIVATE_THREAD }),
+      makeChannel({ type: PACKAGE_CHANNEL_TYPE.GUILD_ANNOUNCEMENT_THREAD }),
+      makeChannel({ type: PACKAGE_CHANNEL_TYPE.GUILD_FORUM }),
+      makeChannel({ type: PACKAGE_CHANNEL_TYPE.DM }),
+    ];
+    const out = computeChannelTypeBreakdown(channels);
+    expect(out).toEqual({ guildText: 1, dms: 1, groupDms: 0, threads: 2, orphans: 0, other: 1 });
+    const total = Object.values(out).reduce((a, b) => a + b, 0);
+    expect(total).toBe(channels.length);
   });
 });
 

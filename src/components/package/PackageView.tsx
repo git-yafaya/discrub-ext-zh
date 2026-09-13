@@ -162,7 +162,12 @@ const PackageView = () => {
 
   const { user, channels, guilds, totalMessages } = parsed;
   const orphanCount = channels.filter((c) => c.isOrphan).length;
-  const dmCount = channels.filter((c) => c.type === 1 || c.type === 3).length;
+  // #270: count through the category so the chip and the sidebar agree
+  // (orphans excluded, inferred DMs included).
+  const dmCount = channels.filter((c) => {
+    const category = getPackageChannelCategory(c);
+    return category === 'dm' || category === 'groupDm';
+  }).length;
   const nonEmptyChannels = channels.filter((c) => c.messageCount > 0).length;
   const channelsChipLabel =
     channels.length === nonEmptyChannels

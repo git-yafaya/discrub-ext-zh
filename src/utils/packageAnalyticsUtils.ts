@@ -1,3 +1,4 @@
+import { getPackageChannelCategory } from '@/features/package/packageDisplayUtils';
 import {
   PACKAGE_CHANNEL_TYPE,
   type PackageChannel,
@@ -27,6 +28,7 @@ export interface ChannelTypeBreakdown {
   groupDms: number;
   threads: number;
   orphans: number;
+  other: number;
 }
 
 export function computeTopChannels(
@@ -82,24 +84,28 @@ export function computeChannelTypeBreakdown(
     groupDms: 0,
     threads: 0,
     orphans: 0,
+    other: 0,
   };
+  // #270: one classification for the sidebar, the chip, and this card.
   for (const c of channels) {
-    if (c.isOrphan) {
-      result.orphans += 1;
-      continue;
-    }
-    switch (c.type) {
-      case PACKAGE_CHANNEL_TYPE.GUILD_TEXT:
+    switch (getPackageChannelCategory(c)) {
+      case 'orphan':
+        result.orphans += 1;
+        break;
+      case 'guildText':
         result.guildText += 1;
         break;
-      case PACKAGE_CHANNEL_TYPE.DM:
+      case 'dm':
         result.dms += 1;
         break;
-      case PACKAGE_CHANNEL_TYPE.GROUP_DM:
+      case 'groupDm':
         result.groupDms += 1;
         break;
-      case PACKAGE_CHANNEL_TYPE.GUILD_PUBLIC_THREAD:
+      case 'thread':
         result.threads += 1;
+        break;
+      case 'unknown':
+        result.other += 1;
         break;
     }
   }
