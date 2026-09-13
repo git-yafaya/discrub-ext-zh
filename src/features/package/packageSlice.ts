@@ -1,9 +1,7 @@
 import { createSlice, createAsyncThunk, type PayloadAction } from '@reduxjs/toolkit';
+import { validatePackage } from '@/services/packageValidation';
 import {
-  validatePackage,
-} from '@/services/packageParseService';
-import {
-  streamPackageToStorage,
+  importPackageToStorage,
   loadChannelMessagesFromStorage,
   resumePackageFromStorage,
   clearPackageContents,
@@ -67,6 +65,7 @@ import type {
   PackageMessage,
   PackageValidationResult,
   ParsedPackage,
+  ImportDiagnostics,
 } from './packageTypes';
 import { t } from '@/i18n';
 
@@ -1826,6 +1825,9 @@ const packageSlice = createSlice({
     clearPackageFilterCriteria(state, action: PayloadAction<string>) {
       delete state.filterCriteria[action.payload];
     },
+    setImportProgress(state, action: PayloadAction<{ read: number; total: number } | null>) {
+      state.importProgress = action.payload;
+    },
     dismissDeleteResult(state) {
       state.deleteResult = null;
       state.deleteError = null;
@@ -1962,6 +1964,7 @@ const packageSlice = createSlice({
       .addCase(importPackage.pending, (state) => {
         state.status = 'parsing';
         state.error = null;
+        state.importProgress = null;
       })
       .addCase(importPackage.fulfilled, (state, action) => {
         state.status = 'ready';
@@ -1985,6 +1988,7 @@ const packageSlice = createSlice({
         state.error = action.payload ?? 'Unknown error';
         state.parsed = null;
         state.validation = null;
+        state.importProgress = null;
       })
       .addCase(resumeStoredPackage.fulfilled, (state, action) => {
         if (!action.payload) return; // nothing to resume
@@ -2164,6 +2168,7 @@ export const {
   clearChannelEnrichmentState,
   setPackageFilterCriteria,
   clearPackageFilterCriteria,
+  setImportProgress,
 } = packageSlice.actions;
 export default packageSlice.reducer;
 
@@ -2204,6 +2209,8 @@ export const selectDeleteStatus = (state: RootState) => state.package.deleteStat
 export const selectDeleteProgress = (state: RootState) => state.package.deleteProgress;
 export const selectDeleteResult = (state: RootState) => state.package.deleteResult;
 export const selectDeleteError = (state: RootState) => state.package.deleteError;
+/** #269: compressed bytes read so far by a running import. */
+export const selectImportProgress = (state: RootState) => state.package.importProgress;
 export const selectPackageExportStatus = (state: RootState) =>
   state.package.exportStatus;
 export const selectChannelDeletedMessageIds =

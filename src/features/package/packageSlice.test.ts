@@ -221,3 +221,72 @@ describe('packageSlice — reducers', () => {
     expect(await enrichmentCache.get(USER, '300')).toBeNull();
   });
 });
+
+
+describe('packageSlice — import progress and diagnostics (#269)', () => {
+  it('tracks bytes read while importing and clears them when done', async () => {
+    const store = makeStore('253286221395001345');
+    const blob = await buildFixturePackage();
+    const seen: Array<{ read: number; total: number } | null> = [];
+    const unsubscribe = (store as unknown as { subscribe: (l: () => void) => () => void }).subscribe(() => {
+      seen.push(store.getState().package.importProgress);
+    });
+    await store.dispatch(importPackage(blob));
+    unsubscribe();
+
+    const ticks = seen.filter((p): p is { read: number; total: number } => p !== null);
+    expect(ticks.length).toBeGreaterThan(0);
+    expect(ticks[ticks.length - 1].read).toBe(blob.size);
+    expect(ticks[ticks.length - 1].total).toBe(blob.size);
+    expect(store.getState().package.importProgress).toBeNull();
+  });
+
+  it('clears the progress on a failed import and on clearPackage', async () => {
+    const store = makeStore('253286221395001345');
+    await store.dispatch(importPackage(await buildFixturePackage({ omitUserJson: true })));
+    expect(store.getState().package.status).toBe('error');
+    expect(store.getState().package.importProgress).toBeNull();
+
+    store.dispatch({ type: 'package/setImportProgress', payload: { read: 1, total: 2 } });
+    store.dispatch(clearPackage());
+    expect(store.getState().package.importProgress).toBeNull();
+  });
+
+  it('writes one status line about what was read, on import but not on resume', async () => {
+    const { resumeStoredPackage } = await import('./packageSlice');
+    const statusReducer = (await import('@features/status/statusSlice')).default;
+    const store = configureStore({
+      reducer: { package: packageReducer, user: userReducer, status: statusReducer },
+    }) as unknown as { dispatch: ThunkDispatch<RootState, unknown, UnknownAction>; getState: () => RootState };
+    store.dispatch({ type: 'user/setCurrentUser', payload: { id: '253286221395001345', username: 'tester' } });
+
+    await store.dispatch(importPackage(await buildFixturePackage()));
+    const afterImport = store.getState().status.entries.filter((e) => e.message.startsWith('Package read:'));
+    expect(afterImport).toHaveLength(1);
+    expect(afterImport[0].level).toBe('info');
+    expect(afterImport[0].message).toBe('Package read: 2 channels, 4 messages.');
+
+    await store.dispatch(resumeStoredPackage());
+    const afterResume = store.getState().status.entries.filter((e) => e.message.startsWith('Package read:'));
+    expect(afterResume).toHaveLength(1);
+  });
+
+  it('warns when folders were skipped or a channel stored no rows', async () => {
+    const statusReducer = (await import('@features/status/statusSlice')).default;
+    const store = configureStore({
+      reducer: { package: packageReducer, user: userReducer, status: statusReducer },
+    }) as unknown as { dispatch: ThunkDispatch<RootState, unknown, UnknownAction>; getState: () => RootState };
+    store.dispatch({ type: 'user/setCurrentUser', payload: { id: '253286221395001345', username: 'tester' } });
+
+    await store.dispatch(importPackage(await buildFixturePackage({
+      renamedMessageKeys: true,
+      includeOrphanChannel: true,
+      brokenFolders: [{ id: '400', drop: 'messages' }],
+    })));
+    const line = store.getState().status.entries.find((e) => e.message.startsWith('Package read:'));
+    expect(line?.level).toBe('warning');
+    expect(line?.message).toBe(
+      'Package read: 2 channels, 4 messages. 1 channel folder was skipped (1 without a messages file). 1 channel listed messages Discrub could not read (fields seen: id, timestamp, contents, attachments).',
+    );
+  });
+});

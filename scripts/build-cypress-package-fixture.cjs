@@ -119,14 +119,100 @@ function buildBasePackage({
     [HEADER, '3001,2020-01-01 00:00:00.000000+00:00,old message,'].join('\n'),
   );
 
-  // Activity dir — parser must NOT read this
-  zip.file('activity/reporting.json', '{}');
+  // Activity dir — parser must NOT read this. Deflated, and its
+  // compressed bytes get overwritten with garbage after zipping (see
+  // corruptEntryPayload): inflating it would throw, so a clean import
+  // proves the reader never inflates what it does not need (#269).
+  // JSZip defaults to STORE, and fflate does not verify CRCs, so a
+  // stored garbage entry would prove nothing.
+  zip.file('activity/reporting.json', ACTIVITY_FILLER, { compression: 'DEFLATE' });
 
   return zip;
 }
 
-async function writeZip(zip, filepath) {
+const ACTIVITY_FILLER = Array.from({ length: 512 }, (_, i) => `event-${i}-${(i * 7919) % 1000}`).join('\n');
+
+/**
+ * Overwrites the compressed payload of one entry in a finished archive.
+ * Finds the local header by file name; JSZip writes sizes in the local
+ * header (no data descriptor), so the payload starts right after the
+ * header, name, and extra field.
+ */
+function corruptEntryPayload(buf, name) {
+  const nameBytes = Buffer.from(name, 'utf8');
+  for (let i = 0; i + 30 + nameBytes.length <= buf.length; i++) {
+    if (buf.readUInt32LE(i) !== 0x04034b50) continue;
+    const fnl = buf.readUInt16LE(i + 26);
+    const es = buf.readUInt16LE(i + 28);
+    if (fnl !== nameBytes.length) continue;
+    if (!buf.subarray(i + 30, i + 30 + fnl).equals(nameBytes)) continue;
+    const compressedSize = buf.readUInt32LE(i + 18);
+    const start = i + 30 + fnl + es;
+    buf.fill(0xff, start, start + compressedSize);
+    return;
+  }
+  throw new Error(`fixture entry not found: ${name}`);
+}
+
+/**
+ * #271: the base package plus one busy guild channel (id 500, "busy")
+ * holding 60 messages (ids 5001..5060), so a package purge spec can
+ * exercise the every-50 progress line and the short wait after a 404.
+ */
+function buildManyPackage(opts) {
+  const zip = buildBasePackage(opts);
+  zip.file(
+    'messages/c500/channel.json',
+    JSON.stringify({
+      id: '500',
+      type: 0,
+      name: 'busy',
+      guild: { id: '901000000000000001', name: 'Cypress Test Server' },
+    }),
+  );
+  const rows = [HEADER];
+  for (let i = 1; i <= 60; i++) {
+    const minute = String(i % 60).padStart(2, '0');
+    const hour = String(10 + Math.floor(i / 60)).padStart(2, '0');
+    rows.push(`${5000 + i},2023-03-01 ${hour}:${minute}:00.000000+00:00,busy message ${i},`);
+  }
+  zip.file('messages/c500/messages.csv', rows.join('\n'));
+
+  // #270: a DM whose channel.json spells the type as a name, the way
+  // some newer exports do, and a channel with no type, guild, or
+  // recipients at all. The first must land under Direct Messages, the
+  // second under Other.
+  zip.file(
+    'messages/c600/channel.json',
+    JSON.stringify({ id: '600', type: 'DM', recipients: [opts.userId, 'named-friend'] }),
+  );
+  zip.file(
+    'messages/c600/messages.csv',
+    [HEADER, '6001,2023-04-01 00:00:00.000000+00:00,named type dm,'].join('\n'),
+  );
+  zip.file('messages/c700/channel.json', JSON.stringify({ id: '700', name: 'mystery' }));
+  // The index names the new DM the way Discord does; 700 stays unnamed there.
+  zip.file(
+    'messages/index.json',
+    JSON.stringify({
+      '200': 'general',
+      '300': 'Direct Message with tester-friend#0',
+      '400': 'Old Guild Channel',
+      '500': 'busy',
+      '600': 'Direct Message with named-friend#0',
+      '700': null,
+    }),
+  );
+  zip.file(
+    'messages/c700/messages.csv',
+    [HEADER, '7001,2023-05-01 00:00:00.000000+00:00,no type at all,'].join('\n'),
+  );
+  return zip;
+}
+
+async function writeZip(zip, filepath, corrupt = 'activity/reporting.json') {
   const buf = await zip.generateAsync({ type: 'nodebuffer' });
+  if (corrupt && zip.file(corrupt)) corruptEntryPayload(buf, corrupt);
   fs.writeFileSync(filepath, buf);
   console.log(
     `  ${path.relative(process.cwd(), filepath)}  (${buf.length.toLocaleString()} bytes)`,

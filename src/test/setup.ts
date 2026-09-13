@@ -11,12 +11,62 @@ import { afterEach, beforeAll, afterAll } from 'vitest';
 import { installChromeMocks, cleanupChromeMocks } from './chrome-mocks';
 import { server as mswServer } from './msw/server';
 import { webcrypto } from 'node:crypto';
+import { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { applyLanguage } from '../i18n';
 
 // jsdom's crypto has getRandomValues but no SubtleCrypto; the supporter
 // key verification needs WebCrypto Ed25519, so borrow Node's.
 if (!globalThis.crypto?.subtle) {
   Object.defineProperty(globalThis.crypto, 'subtle', { value: webcrypto.subtle });
+}
+
+// jsdom's Blob has neither `stream()` nor `arrayBuffer()`, and jsdom
+// has no ReadableStream. The package import reads Files through
+// `stream()` (#269), so give the test Blob the same surface, built on
+// FileReader over small slices so the chunked path is exercised.
+if (typeof globalThis.ReadableStream === 'undefined') {
+  Object.defineProperty(globalThis, 'ReadableStream', { value: NodeReadableStream, writable: true, configurable: true });
+}
+const readSlice = (blob: Blob): Promise<ArrayBuffer> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error ?? new Error('FileReader failed'));
+    reader.readAsArrayBuffer(blob);
+  });
+if (typeof Blob.prototype.arrayBuffer !== 'function') {
+  Object.defineProperty(Blob.prototype, 'arrayBuffer', {
+    configurable: true,
+    writable: true,
+    value: function arrayBuffer(this: Blob) {
+      return readSlice(this);
+    },
+  });
+}
+const TEST_STREAM_CHUNK = 8 * 1024;
+const chunkedStream = (source: Blob): ReadableStream<Uint8Array> => {
+  let offset = 0;
+  return new (globalThis.ReadableStream as typeof ReadableStream)<Uint8Array>({
+    async pull(controller) {
+      if (offset >= source.size) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + TEST_STREAM_CHUNK, source.size);
+      const buffer = await readSlice(source.slice(offset, end));
+      offset = end;
+      controller.enqueue(new Uint8Array(buffer));
+    },
+  });
+};
+if (typeof Blob.prototype.stream !== 'function') {
+  Object.defineProperty(Blob.prototype, 'stream', {
+    configurable: true,
+    writable: true,
+    value: function stream(this: Blob) {
+      return chunkedStream(this);
+    },
+  });
 }
 
 // Install Chrome extension API mocks globally

@@ -1,27 +1,24 @@
 /**
- * Package streaming + IDB-backed lazy reads (Backlog #162).
+ * Package streaming + IDB-backed lazy reads (Backlog #162, #269).
  *
- * Replaces the v2.0.3 architecture where the entire package was held
- * decompressed in memory for the lifetime of the session. The eager
- * `unzipSync` pass blew V8's per-allocation cap (~2GB) on multi-GB Discord
- * exports; every `loadChannelMessages` call additionally re-decompressed
- * the whole archive from the original File handle.
+ * The archive is read once, in chunks, through `packageZipReader`:
+ * every entry is classified by its path before anything is inflated,
+ * so the Activity folders (most of a real package) never enter memory,
+ * and the File is never read whole (Chrome refuses `arrayBuffer()`
+ * past about 2 GiB, which is what kept full packages out).
  *
- * The new shape:
- *   1. `streamPackageToStorage(file, opts)` — one streaming pass through
- *      fflate's async `unzip`. Activity / programs / activities_e dirs are
- *      filtered out at decompress-time so their bytes never enter memory.
- *      Each non-skipped entry is processed and written to IndexedDB before
- *      we move on. Returns the same `ParsedPackage` shape callers already
- *      consume; the underlying File reference is not retained.
- *   2. `loadChannelMessagesFromStorage(userId, channelId)` — pure IDB read.
- *      O(1), no decompression, instant.
- *   3. `clearPackageContents(userId?)` — wipes the `pkg:*` namespace (or
- *      just the entries owned by `userId`). Used when closing a package
- *      and at the start of a new import to avoid orphaned data.
- *   4. `resumePackageFromStorage(userId)` — rebuilds a `ParsedPackage`
- *      from a previously-streamed package without touching the file
- *      handle. Returns null if nothing in IDB matches.
+ * Two passes over the source:
+ *   1. Read until `user.json` arrives, then stop. Account is first in
+ *      Discord's layout, so this is a few KB; it tells us whose
+ *      `pkg:*` keys to write.
+ *   2. Read everything wanted: avatar, guild.json files, index.json
+ *      candidates, and every channel folder's channel.json plus
+ *      messages file. A folder is parsed and written to IndexedDB the
+ *      moment both of its files have arrived, so peak memory is one
+ *      chunk plus one channel.
+ *
+ * Names are resolved at the end (the index.json may arrive after the
+ * channels), then `pkg:meta` is written last as the commit marker.
  *
  * IndexedDB schema (under `Discrub-package`, alongside the existing
  * `enriched:` and `deleted:` namespaces — non-conflicting prefix):
@@ -29,18 +26,18 @@
  *   pkg:schema-version      → 1 (singleton, used by future migrations)
  *   pkg:meta:{userId}       → ParsedPackage minus avatarBlobUrl
  *   pkg:msgs:{userId}:{cid} → PackageMessage[]
- *   pkg:avatar:{userId}     → Blob (user avatar) | absent
- *
- * `pkg:meta` is the "ready" marker — written last, so a partially-streamed
- * package is detectable on next boot (no meta key → cleanup partial state).
+ *   pkg:avatar:{userId}     → Uint8Array (user avatar) | absent
  */
 
-import { unzipSync, strFromU8 } from 'fflate';
+import { strFromU8 } from 'fflate';
 import { storage } from '@/extension/storage';
 import { countCsvRows, parseMessagesCsv } from '@/utils/csvParser';
-import { countJsonMessages, parseMessagesJson, parseSnowflakeJson } from '@/utils/jsonParser';
+import { parseMessagesJsonDetailed, parseSnowflakeJson } from '@/utils/jsonParser';
 import {
+  GUILD_CHANNEL_TYPES,
   PACKAGE_CHANNEL_TYPE,
+  normalizePackageChannelType,
+  type ImportDiagnostics,
   type PackageChannel,
   type PackageChannelType,
   type PackageGuild,
@@ -48,7 +45,8 @@ import {
   type PackageUser,
   type ParsedPackage,
 } from '@/features/package/packageTypes';
-import { PackageParseError } from './packageParseService';
+import { PackageParseError } from './packageValidation';
+import { readPackageEntries, readBlobAsArrayBuffer, type PackageZipSource } from './packageZipReader';
 
 export const PKG_SCHEMA_VERSION = 1;
 
@@ -61,20 +59,24 @@ const KEY_AVATAR = (userId: string) => `pkg:avatar:${userId}`;
 const PKG_PREFIX = 'pkg:';
 
 /**
- * Top-level dirs Discord ships in a package that we never read. Skipping
- * them at decompress-time is the load-bearing piece of the OOM fix —
- * Activity is 3.2GB of 3.6GB on the reference real-world archive. They
- * stay in the central directory (so we know they exist) but their
- * compressed bytes never get inflated.
- *
- * Discord ships these in English regardless of UI locale; verified across
- * en/fr/de samples in `package-fixtures.ts`. If that ever changes, an
- * unrecognized name is harmless: we'd just fail to skip and pay
- * decompression cost we don't need (current behavior pre-#162).
+ * Top-level dirs Discord ships in a package that we never read. Kept as
+ * documentation: the reader wants entries by file shape, so anything
+ * under these (and anything else unrecognised) is discarded without
+ * being inflated.
  */
-const SKIPPED_TOP_DIRS = ['activity', 'activities_e', 'activities_w', 'programs'];
+export const SKIPPED_TOP_DIRS = ['activity', 'activities_e', 'activities_w', 'programs'];
 
-const SOFT_COMPRESSED_WARN_BYTES = 1024 * 1024 * 1024; // 1 GiB
+/**
+ * Entry shapes the import reads, matched case-insensitively against the
+ * full path with an optional single wrapper directory (macOS re-zips).
+ * Folder names are not matched, so localised and capitalised layouts
+ * (`konto/`, `Messages/`) need no sniffing.
+ */
+const USER_RE = /^(?:[^/]+\/)?[^/]+\/user\.json$/i;
+const AVATAR_RE = /^(?:[^/]+\/)?[^/]+\/avatar\.png$/i;
+const GUILD_RE = /^(?:[^/]+\/)?[^/]+\/\d+\/guild\.json$/i;
+const INDEX_RE = /^(?:[^/]+\/)?[^/]+\/index\.json$/i;
+const CHANNEL_RE = /^((?:[^/]+\/)?[^/]+)\/c?(\d+)\/(channel\.json|messages\.(json|csv))$/i;
 
 export interface StreamProgress {
   current: number;
@@ -83,8 +85,13 @@ export interface StreamProgress {
 }
 
 export interface StreamOptions {
+  /** One tick per channel written, then avatar, then metadata. */
   onProgress?: (info: StreamProgress) => void;
+  /** Compressed bytes read so far, for a determinate progress bar. */
+  onBytes?: (readBytes: number, totalBytes: number) => void;
   shouldStop?: () => boolean | Promise<boolean>;
+  /** Bytes per push into the ZIP reader. Tests use tiny values. */
+  chunkSize?: number;
 }
 
 export class PackageStreamCancelledError extends Error {
@@ -94,154 +101,412 @@ export class PackageStreamCancelledError extends Error {
   }
 }
 
+export interface PackageImportResult {
+  parsed: ParsedPackage;
+  diagnostics: ImportDiagnostics;
+}
+
 /**
  * Stream a Discord package into IndexedDB. Returns the parsed metadata
- * the consumer slice already expects, with the underlying File handle
- * dropped on the floor — every subsequent read is an IDB lookup.
+ * plus what the reader saw on the way (#269). The File handle is not
+ * retained; every later read is an IDB lookup.
  *
  * Atomicity model: if we throw or `shouldStop` fires, partially-written
- * `pkg:*` keys are cleaned up before re-raising. Callers don't need to
- * defend against half-loaded state. The `pkg:meta:{userId}` key is the
- * commit marker; it's written last.
+ * `pkg:*` keys are cleaned up before re-raising. The `pkg:meta:{userId}`
+ * key is the commit marker; it's written last.
+ *
+ * A NotReadableError from the source (an antivirus scan or a synced
+ * folder briefly relocking the file, #203) restarts the whole import
+ * once after a short wait.
  */
+export async function importPackageToStorage(
+  input: File | Blob | ArrayBuffer,
+  opts: StreamOptions = {},
+): Promise<PackageImportResult> {
+  let source: PackageZipSource | null = null;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      source ??= await openSource(input);
+      return await runImport(source, opts);
+    } catch (err) {
+      if (!isNotReadable(err) || attempt >= 1) throw err;
+      // A fresh stream next time; a pre-read buffer cannot go stale.
+      if (!(source instanceof ArrayBuffer)) source = null;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+  }
+}
+
+/** Backward-compatible shape: just the parsed package. */
 export async function streamPackageToStorage(
   input: File | Blob | ArrayBuffer,
   opts: StreamOptions = {},
 ): Promise<ParsedPackage> {
-  const { onProgress, shouldStop } = opts;
+  return (await importPackageToStorage(input, opts)).parsed;
+}
 
+/**
+ * A Blob that can stream is used as-is (each pass opens a fresh
+ * stream). Anything else is read once into memory here so both passes
+ * share the bytes and a flaky read is retried at one place.
+ */
+async function openSource(input: File | Blob | ArrayBuffer): Promise<PackageZipSource> {
+  if (input instanceof ArrayBuffer) return input;
+  if (typeof (input as Blob).stream === 'function') return input;
+  return readBlobAsArrayBuffer(input);
+}
+
+function isNotReadable(err: unknown): boolean {
+  return (err as { name?: string } | null)?.name === 'NotReadableError';
+}
+
+type RawChannelJson = {
+  id?: string | number;
+  type?: unknown;
+  name?: string;
+  guild?: { id?: string; name?: string };
+  recipients?: string[];
+};
+
+type RawUserJson = {
+  id: string;
+  username: string;
+  global_name?: string | null;
+  avatar_hash?: string | null;
+  email?: string;
+};
+
+type RawGuildJson = {
+  id: string;
+  name: string;
+};
+
+/** What one channel folder produced, before names and types are resolved. */
+interface ChannelRecord {
+  id: string;
+  rawType: unknown;
+  rawName: string | null;
+  guildId?: string;
+  rawGuildName?: string;
+  recipients?: string[];
+  messageCount: number;
+  storedCount: number;
+  format: 'json' | 'csv';
+  /** Lower-cased parent folder of the channel folder, e.g. `messages`. */
+  parent: string;
+  sampleRowKeys: string[] | null;
+}
+
+interface PendingFolder {
+  id: string;
+  parent: string;
+  channelJson?: Uint8Array;
+  messages?: { bytes: Uint8Array; format: 'json' | 'csv' };
+}
+
+async function runImport(
+  source: PackageZipSource,
+  opts: StreamOptions,
+): Promise<PackageImportResult> {
+  const { onProgress, onBytes, shouldStop, chunkSize } = opts;
+  const diagnostics: ImportDiagnostics = {
+    entriesSeen: 0,
+    channelFoldersSeen: 0,
+    channelsBuilt: 0,
+    droppedMissingChannelJson: 0,
+    droppedMissingMessages: 0,
+    droppedUnparsableChannelJson: 0,
+    channelsWithNoStoredRows: 0,
+    sampleRowKeys: null,
+    unrecognizedTypes: 0,
+    bytesRead: 0,
+  };
   const totalCompressed =
-    input instanceof ArrayBuffer
-      ? input.byteLength
-      : 'size' in input
-        ? input.size
-        : 0;
-  if (totalCompressed > SOFT_COMPRESSED_WARN_BYTES) {
-    // Single source of telemetry-of-sorts for "we're approaching the
-    // option-A → option-B threshold." Compressed sizes near 1.5GB
-    // would be the trigger to migrate to fflate's `Unzip` streaming
-    // class; today's reference package is 378MB compressed.
-    console.warn(
-      `[packageStream] Compressed package size is ${formatBytes(totalCompressed)}. Approaching the single-allocation ceiling; consider migrating to streaming Unzip class if this becomes common.`,
-    );
-  }
+    source instanceof ArrayBuffer ? source.byteLength
+    : source instanceof Uint8Array ? source.length
+    : source.size;
 
-  // Pass 1: decompress everything except the SKIPPED top-level dirs.
-  // We use the `filter` callback to short-circuit decompression at the
-  // entry level — the body of those entries is never inflated and never
-  // enters our address space.
-  // #203: when the caller already read the bytes (ImportDialog reads the File
-  // the instant it's selected, while the descriptor is fresh), use them
-  // directly. Otherwise read here, retrying a transient NotReadableError.
-  const buffer =
-    input instanceof ArrayBuffer ? input : await readBlobWithRetry(input);
-  const filesByPath = unzipFiltered(new Uint8Array(buffer));
-
-  if (await shouldHalt(shouldStop)) {
-    throw new PackageStreamCancelledError();
-  }
-
-  // Build helpers identical to the legacy parser; the actual parse
-  // logic is unchanged, only the storage destination is.
-  const caseIndex = buildCaseIndex(filesByPath);
-  const sniff = sniffStructure(caseIndex);
-  if (!sniff) {
+  // Pass 1: find user.json and stop.
+  let user: PackageUser | null = null;
+  let userPath = '';
+  await readPackageEntries(source, {
+    want: (path) => USER_RE.test(path),
+    onEntry: (path, bytes) => {
+      if (user) return;
+      user = parseUserJson(bytes);
+      userPath = path.toLowerCase();
+    },
+    shouldStop: () => user !== null,
+    chunkSize,
+  });
+  if (!user) {
     throw new PackageParseError('Package is missing account/user.json');
   }
-  const { prefix, aliases } = sniff;
+  const foundUser: PackageUser = user;
+  const userId = foundUser.id;
 
-  // user.json comes first so we know the userId for every subsequent
-  // write key. A wipe of any other user's lingering pkg:* entries
-  // happens once we know who we are.
-  const user = readUserJson(filesByPath, caseIndex, prefix, aliases);
+  if (await shouldHalt(shouldStop)) throw new PackageStreamCancelledError();
+
+  // Any other package's lingering pkg:* entries go now that we know who we are.
   await clearPackageContents();
   await storage.package.set(KEY_SCHEMA, PKG_SCHEMA_VERSION);
 
-  const guilds = readGuilds(filesByPath, caseIndex, prefix, aliases);
-  const channelNameIndex = readChannelNameIndex(filesByPath, caseIndex, prefix, aliases);
-
-  // Walk channel directories, parse + persist each in turn so the
-  // post-streaming Redux state has channel metadata + IDB has every
-  // channel's messages keyed for instant retrieval.
-  const channels: PackageChannel[] = [];
-  const channelDirs = collectChannelDirs(caseIndex, prefix, aliases.messages);
-  // Track whether we encounter any legacy-format channel. Discord's
-  // pre-2025-06-14 packages ship messages.csv; current packages ship
-  // messages.json. Surfaced on ParsedPackage so the export dialog can
-  // warn about potentially-expired attachment URLs.
-  let hasLegacyFormat = false;
-
+  // Pass 2: everything else, written as it arrives.
+  const guilds = new Map<string, string>();
+  const indexCandidates = new Map<string, Record<string, string | null>>();
+  const pending = new Map<string, PendingFolder>();
+  const records: ChannelRecord[] = [];
+  let avatarBytes: Uint8Array | null = null;
   let processed = 0;
-  const total = channelDirs.size + 2; // channels + avatar + meta
+  let cancelled = false;
 
-  for (const id of channelDirs) {
-    if (await shouldHalt(shouldStop)) {
-      await clearPackageContents(user.id);
-      throw new PackageStreamCancelledError();
+  const persistFolder = async (folder: PendingFolder) => {
+    if (!folder.channelJson || !folder.messages) return;
+    const record = await buildChannelRecord(folder, userId);
+    if (!record) {
+      diagnostics.droppedUnparsableChannelJson++;
+      return;
     }
-
-    const result = await persistChannel(
-      filesByPath, caseIndex, prefix, aliases,
-      id, channelNameIndex, guilds, user.id,
-    );
-    if (result) {
-      channels.push(result.channel);
-      if (result.format === 'csv') hasLegacyFormat = true;
+    records.push(record);
+    diagnostics.channelsBuilt++;
+    if (record.messageCount > 0 && record.storedCount === 0) {
+      diagnostics.channelsWithNoStoredRows++;
+      diagnostics.sampleRowKeys ??= record.sampleRowKeys;
     }
-
     processed++;
-    onProgress?.({
-      current: processed,
-      total,
-      path: `messages/${id}`,
+    onProgress?.({ current: processed, total: processed + 2, path: `messages/${folder.id}` });
+    if (await shouldHalt(shouldStop)) cancelled = true;
+  };
+
+  try {
+    await readPackageEntries(source, {
+      want: (path) => {
+        diagnostics.entriesSeen++;
+        const lower = path.toLowerCase();
+        if (lower === userPath) return false;
+        return AVATAR_RE.test(path) || GUILD_RE.test(path) || INDEX_RE.test(path) || CHANNEL_RE.test(path);
+      },
+      onEntry: async (path, bytes) => {
+        const channel = CHANNEL_RE.exec(path);
+        if (channel) {
+          const parent = channel[1].toLowerCase();
+          const id = channel[2];
+          const file = channel[3].toLowerCase();
+          const key = `${parent}/${id}`;
+          let folder = pending.get(key);
+          if (!folder) {
+            folder = { id, parent };
+            pending.set(key, folder);
+            diagnostics.channelFoldersSeen++;
+          }
+          if (file === 'channel.json') {
+            folder.channelJson = bytes;
+          } else {
+            folder.messages = { bytes, format: file.endsWith('.csv') ? 'csv' : 'json' };
+          }
+          if (folder.channelJson && folder.messages) {
+            pending.delete(key);
+            await persistFolder(folder);
+          }
+          return;
+        }
+        if (AVATAR_RE.test(path)) {
+          avatarBytes ??= bytes;
+          return;
+        }
+        if (GUILD_RE.test(path)) {
+          try {
+            const raw = parseSnowflakeJson<RawGuildJson>(strFromU8(bytes));
+            if (raw.id && raw.name) guilds.set(String(raw.id), raw.name);
+          } catch {
+            /* skip malformed guild.json */
+          }
+          return;
+        }
+        if (INDEX_RE.test(path)) {
+          const parent = path.toLowerCase().replace(/\/index\.json$/, '');
+          try {
+            const parsed = parseSnowflakeJson<Record<string, string | null>>(strFromU8(bytes));
+            if (parsed && typeof parsed === 'object') indexCandidates.set(parent, parsed);
+          } catch {
+            /* an unreadable index only costs names */
+          }
+        }
+      },
+      onBytes: (read, total) => {
+        diagnostics.bytesRead = read;
+        onBytes?.(read, total);
+      },
+      shouldStop: () => cancelled,
+      chunkSize,
     });
+    if (cancelled || (await shouldHalt(shouldStop))) throw new PackageStreamCancelledError();
+  } catch (err) {
+    await clearPackageContents(userId);
+    throw err;
   }
 
+  // Folders that never got both files.
+  for (const folder of pending.values()) {
+    if (folder.channelJson) diagnostics.droppedMissingMessages++;
+    else diagnostics.droppedMissingChannelJson++;
+  }
+
+  // The name index is the index.json that sits beside the channel folders.
+  const nameIndex = pickNameIndex(indexCandidates, records);
+
+  const channels: PackageChannel[] = records.map((record) => {
+    const resolved = resolveChannelType(record, nameIndex[record.id] ?? null);
+    if (resolved === PACKAGE_CHANNEL_TYPE.UNKNOWN) diagnostics.unrecognizedTypes++;
+    const isOrphan = GUILD_CHANNEL_TYPES.has(resolved) && !record.guildId;
+    return {
+      id: record.id,
+      type: resolved,
+      name: record.rawName ?? nameIndex[record.id] ?? null,
+      guildId: record.guildId,
+      guildName: record.guildId ? record.rawGuildName ?? guilds.get(record.guildId) : undefined,
+      recipients: record.recipients,
+      messageCount: record.messageCount,
+      isOrphan,
+    };
+  });
   channels.sort((a, b) => b.messageCount - a.messageCount);
 
-  // Avatar — persist the raw bytes (Uint8Array) and mint a fresh
-  // blob URL on every load. The previous-session blob URL never
-  // survived a refresh, but the bytes were thrown away too; now they
-  // persist and resume can hand back a valid URL again. Storing as
-  // Uint8Array (instead of Blob) sidesteps fake-indexeddb's
-  // Blob-clone limitation in tests; real browsers handle either fine.
+  // Avatar — persist the raw bytes and mint a fresh blob URL per load.
   let avatarBlobUrl: string | undefined;
-  const avatarBytes = resolveStructural(filesByPath, caseIndex, prefix, aliases, 'account/avatar.png');
   if (avatarBytes) {
-    await storage.package.set(KEY_AVATAR(user.id), avatarBytes);
+    await storage.package.set(KEY_AVATAR(userId), avatarBytes);
     avatarBlobUrl = makeBlobUrl(new Blob([avatarBytes as BlobPart]));
   }
-
   processed++;
-  onProgress?.({ current: processed, total, path: 'account/avatar.png' });
+  onProgress?.({ current: processed, total: processed + 1, path: 'account/avatar.png' });
 
+  const guildList: PackageGuild[] = Array.from(guilds, ([id, name]) => ({ id, name }));
   const totalMessages = channels.reduce((sum, c) => sum + c.messageCount, 0);
-
   const meta: ParsedPackage = {
-    user,
-    guilds,
+    user: foundUser,
+    guilds: guildList,
     channels,
     totalMessages,
     packageSizeBytes: totalCompressed,
-    isLegacyFormat: hasLegacyFormat,
+    isLegacyFormat: records.some((r) => r.format === 'csv'),
     // avatarBlobUrl is intentionally NOT persisted — blob URLs are
-    // realm-scoped. Resume rebuilds the URL from the stored Blob.
+    // realm-scoped. Resume rebuilds the URL from the stored bytes.
   };
-
-  await storage.package.set(KEY_META(user.id), meta);
-
+  await storage.package.set(KEY_META(userId), meta);
   processed++;
-  onProgress?.({ current: processed, total, path: 'package metadata' });
+  onProgress?.({ current: processed, total: processed, path: 'package metadata' });
 
-  // Best-effort persistence request — promotes the IDB store to
-  // "Persistent" so browsers don't auto-evict under disk pressure.
-  // Some browsers grant automatically, some require a permission
-  // prompt, some always reject; we don't gate the import on any of
-  // those outcomes. A user who declines just gets the default
-  // best-effort storage they had before.
+  // Best-effort persistence request so browsers don't auto-evict the
+  // store under disk pressure. Never gates the import.
   void requestPersistentStorage();
 
-  return { ...meta, avatarBlobUrl };
+  return { parsed: { ...meta, avatarBlobUrl }, diagnostics };
+}
+
+function parseUserJson(bytes: Uint8Array): PackageUser {
+  const raw = parseSnowflakeJson<RawUserJson>(strFromU8(bytes));
+  if (!raw.id || !raw.username) {
+    throw new PackageParseError('account/user.json is malformed');
+  }
+  return {
+    id: String(raw.id),
+    username: raw.username,
+    globalName: raw.global_name ?? null,
+    avatarHash: raw.avatar_hash ?? null,
+    email: raw.email,
+  };
+}
+
+/**
+ * Parses one folder's channel.json and messages file, writes the rows
+ * to IndexedDB, and returns the record. Null when channel.json does not
+ * parse. One JSON.parse per messages file: the raw array length is the
+ * channel's message count, the storable rows are what gets written.
+ */
+async function buildChannelRecord(folder: PendingFolder, userId: string): Promise<ChannelRecord | null> {
+  let raw: RawChannelJson;
+  try {
+    raw = parseSnowflakeJson<RawChannelJson>(strFromU8(folder.channelJson!));
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== 'object') return null;
+  const id = raw.id !== undefined && raw.id !== null && String(raw.id).length > 0 ? String(raw.id) : folder.id;
+
+  const { bytes, format } = folder.messages!;
+  const text = strFromU8(bytes);
+  let messages: PackageMessage[];
+  let messageCount: number;
+  let sampleRowKeys: string[] | null = null;
+  if (format === 'json') {
+    const detailed = parseMessagesJsonDetailed(text);
+    messages = detailed.messages;
+    messageCount = detailed.rawCount;
+    sampleRowKeys = detailed.sampleDroppedKeys;
+  } else {
+    messages = parseMessagesCsv(text);
+    messageCount = countCsvRows(text);
+  }
+  await storage.package.set(KEY_MSGS(userId, id), messages);
+
+  const recipients = Array.isArray(raw.recipients)
+    ? raw.recipients.map((r) => (typeof r === 'object' && r !== null && 'id' in (r as object) ? String((r as { id: unknown }).id) : String(r)))
+    : undefined;
+  return {
+    id,
+    rawType: raw.type,
+    rawName: typeof raw.name === 'string' ? raw.name : null,
+    guildId: raw.guild?.id ? String(raw.guild.id) : undefined,
+    rawGuildName: typeof raw.guild?.name === 'string' ? raw.guild.name : undefined,
+    recipients,
+    messageCount,
+    storedCount: messages.length,
+    format,
+    parent: folder.parent,
+    sampleRowKeys,
+  };
+}
+
+/**
+ * #270: the channel type as Discord wrote it, or inferred from the rest
+ * of the record when it is missing or unrecognised: recipients with no
+ * guild is a DM (two or fewer) or a group DM, an index label starting
+ * "Direct Message with" is a DM, a guild id is a text channel, anything
+ * else is UNKNOWN.
+ */
+function resolveChannelType(record: ChannelRecord, indexLabel: string | null): PackageChannelType {
+  const normalized = normalizePackageChannelType(record.rawType);
+  if (normalized !== null) return normalized;
+  if (record.recipients && !record.guildId) {
+    return record.recipients.length <= 2 ? PACKAGE_CHANNEL_TYPE.DM : PACKAGE_CHANNEL_TYPE.GROUP_DM;
+  }
+  if (indexLabel && /^Direct Message with\s/i.test(indexLabel)) return PACKAGE_CHANNEL_TYPE.DM;
+  if (record.guildId) return PACKAGE_CHANNEL_TYPE.GUILD_TEXT;
+  return PACKAGE_CHANNEL_TYPE.UNKNOWN;
+}
+
+/**
+ * Discord ships `servers/index.json` beside `messages/index.json`. The
+ * one that names channels is the one whose folder produced the channel
+ * records (all channel folders share a parent in a real package).
+ */
+function pickNameIndex(
+  candidates: Map<string, Record<string, string | null>>,
+  records: ChannelRecord[],
+): Record<string, string | null> {
+  if (candidates.size === 0) return {};
+  const parents = new Map<string, number>();
+  for (const r of records) parents.set(r.parent, (parents.get(r.parent) ?? 0) + 1);
+  const ranked = Array.from(parents.entries()).sort((a, b) => b[1] - a[1]);
+  const merged: Record<string, string | null> = {};
+  for (const [parent] of ranked) {
+    const index = candidates.get(parent);
+    if (index) Object.assign(merged, index);
+  }
+  if (Object.keys(merged).length > 0) return merged;
+  // No channel folder matched a candidate: fall back to the only one.
+  return candidates.size === 1 ? Array.from(candidates.values())[0] : {};
 }
 
 /**
@@ -326,385 +591,6 @@ export async function hasStoredPackage(userId: string): Promise<boolean> {
 
 /* ────────── internal helpers ────────── */
 
-function unzipFiltered(bytes: Uint8Array): Record<string, Uint8Array> {
-  // #210: use the SYNCHRONOUS unzipSync, NOT fflate's async `unzip`. The async
-  // API offloads decompression to a Web Worker and structured-clones each
-  // filtered compressed entry across the worker boundary via postMessage —
-  // that clone allocation throws "Failed to execute 'postMessage' on 'Worker':
-  // Data cannot be cloned, out of memory" on memory-constrained devices (the
-  // dollifiedgirl report). #162's `filter` already drops the Activity dirs at
-  // decompress time, so the post-filter decompressed footprint stays well under
-  // V8's single-allocation cap; running on the main thread is safe and removes
-  // the worker/postMessage boundary — and the clone OOM — entirely.
-  try {
-    const files = unzipSync(bytes, {
-      filter: (entry) => {
-        // Drop directory entries and OS junk before we even decide
-        // whether to decompress.
-        if (entry.name.endsWith('/')) return false;
-        if (isJunkPath(entry.name)) return false;
-        // Drop top-level skip dirs by suffix-matching after the optional
-        // wrapper directory. We match "{anything}/{skipDir}/..." and
-        // "{skipDir}/..." both, lower-cased.
-        const lower = entry.name.toLowerCase();
-        for (const dir of SKIPPED_TOP_DIRS) {
-          if (lower.startsWith(`${dir}/`) || lower.includes(`/${dir}/`)) return false;
-        }
-        return true;
-      },
-    });
-    return files ?? {};
-  } catch (err) {
-    throw new PackageParseError(
-      `Failed to read package archive: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
-function isJunkPath(path: string): boolean {
-  if (path.startsWith('__MACOSX/')) return true;
-  const name = path.split('/').pop() ?? '';
-  if (name.startsWith('._')) return true;
-  if (name === '.DS_Store') return true;
-  return false;
-}
-
-type CaseIndex = Map<string, string>;
-
-function buildCaseIndex(files: Record<string, Uint8Array>): CaseIndex {
-  const index = new Map<string, string>();
-  for (const path of Object.keys(files)) {
-    if (isJunkPath(path)) continue;
-    index.set(path.toLowerCase(), path);
-  }
-  return index;
-}
-
-type StructuralAliases = {
-  account: string;
-  messages: string;
-  servers: string;
-};
-
-type StructureSniff = {
-  prefix: string;
-  aliases: StructuralAliases;
-};
-
-function sniffStructure(index: CaseIndex): StructureSniff | null {
-  let accountDir: string | null = null;
-  let prefix = '';
-
-  for (const lower of index.keys()) {
-    if (!lower.endsWith('/user.json')) continue;
-    const segs = lower.split('/');
-    if (segs.length === 2) {
-      accountDir = segs[0];
-      prefix = '';
-      break;
-    }
-    if (segs.length === 3) {
-      prefix = `${segs[0]}/`;
-      accountDir = segs[1];
-      break;
-    }
-  }
-
-  if (!accountDir) return null;
-
-  // Sniff messagesDir by REQUIRING a channel-file pattern child
-  // (`{snowflake}/(channel.json|messages.{csv,json})`). The previous
-  // `tail === 'index.json'` short-circuit was ambiguous: Discord's
-  // current package format ships both `servers/index.json` and
-  // `messages/index.json`, so whichever the iterator encountered
-  // first won, and packages with `servers/index.json` ended up
-  // setting messagesDir='servers' — every channel resolution then
-  // failed silently. Channel-file pattern is sufficient and
-  // unambiguous.
-  let messagesDir: string | null = null;
-  for (const lower of index.keys()) {
-    if (prefix && !lower.startsWith(prefix)) continue;
-    const rel = prefix ? lower.slice(prefix.length) : lower;
-    const slash = rel.indexOf('/');
-    if (slash === -1) continue;
-    const head = rel.slice(0, slash);
-    if (head === accountDir) continue;
-    const tail = rel.slice(slash + 1);
-    if (/^c?\d+\/(channel\.json|messages\.(csv|json))$/.test(tail)) {
-      messagesDir = head;
-      break;
-    }
-  }
-
-  let serversDir: string | null = null;
-  for (const lower of index.keys()) {
-    if (prefix && !lower.startsWith(prefix)) continue;
-    const rel = prefix ? lower.slice(prefix.length) : lower;
-    const segs = rel.split('/');
-    if (segs.length !== 3) continue;
-    if (segs[0] === accountDir || segs[0] === messagesDir) continue;
-    if (!/^\d+$/.test(segs[1])) continue;
-    if (segs[2] !== 'guild.json') continue;
-    serversDir = segs[0];
-    break;
-  }
-
-  return {
-    prefix,
-    aliases: {
-      account: accountDir,
-      messages: messagesDir ?? 'messages',
-      servers: serversDir ?? 'servers',
-    },
-  };
-}
-
-function resolveStructural(
-  files: Record<string, Uint8Array>,
-  index: CaseIndex,
-  prefix: string,
-  aliases: StructuralAliases,
-  canonicalLower: string,
-): Uint8Array | null {
-  const slash = canonicalLower.indexOf('/');
-  if (slash === -1) return null;
-  const head = canonicalLower.slice(0, slash);
-  const tail = canonicalLower.slice(slash + 1);
-  const actualHead =
-    head === 'account' ? aliases.account
-    : head === 'messages' ? aliases.messages
-    : head === 'servers' ? aliases.servers
-    : head;
-  const actual = index.get(`${prefix}${actualHead}/${tail}`);
-  if (!actual) return null;
-  return files[actual] ?? null;
-}
-
-type RawChannelJson = {
-  id: string;
-  type: number;
-  name?: string;
-  guild?: { id: string; name: string };
-  recipients?: string[];
-};
-
-type RawUserJson = {
-  id: string;
-  username: string;
-  global_name?: string | null;
-  avatar_hash?: string | null;
-  email?: string;
-};
-
-type RawGuildJson = {
-  id: string;
-  name: string;
-};
-
-function readUserJson(
-  files: Record<string, Uint8Array>,
-  index: CaseIndex,
-  prefix: string,
-  aliases: StructuralAliases,
-): PackageUser {
-  const entry = resolveStructural(files, index, prefix, aliases, 'account/user.json');
-  if (!entry) {
-    throw new PackageParseError('Package is missing account/user.json');
-  }
-  const raw = parseSnowflakeJson<RawUserJson>(strFromU8(entry));
-  if (!raw.id || !raw.username) {
-    throw new PackageParseError('account/user.json is malformed');
-  }
-  return {
-    id: raw.id,
-    username: raw.username,
-    globalName: raw.global_name ?? null,
-    avatarHash: raw.avatar_hash ?? null,
-    email: raw.email,
-  };
-}
-
-function readGuilds(
-  files: Record<string, Uint8Array>,
-  index: CaseIndex,
-  prefix: string,
-  aliases: StructuralAliases,
-): PackageGuild[] {
-  const guilds: PackageGuild[] = [];
-  const guildRegex = new RegExp(
-    `^${escapeRegex(prefix)}${escapeRegex(aliases.servers)}\\/\\d+\\/guild\\.json$`,
-  );
-  for (const lower of index.keys()) {
-    if (!guildRegex.test(lower)) continue;
-    const actual = index.get(lower);
-    if (!actual) continue;
-    const entry = files[actual];
-    if (!entry) continue;
-    try {
-      const raw = parseSnowflakeJson<RawGuildJson>(strFromU8(entry));
-      if (raw.id && raw.name) guilds.push({ id: raw.id, name: raw.name });
-    } catch {
-      /* skip malformed guild.json */
-    }
-  }
-  return guilds;
-}
-
-function readChannelNameIndex(
-  files: Record<string, Uint8Array>,
-  index: CaseIndex,
-  prefix: string,
-  aliases: StructuralAliases,
-): Record<string, string | null> {
-  const entry = resolveStructural(files, index, prefix, aliases, 'messages/index.json');
-  if (!entry) return {};
-  try {
-    return parseSnowflakeJson<Record<string, string | null>>(strFromU8(entry));
-  } catch {
-    return {};
-  }
-}
-
-function collectChannelDirs(
-  index: CaseIndex,
-  prefix: string,
-  messagesDir: string,
-): Set<string> {
-  const out = new Set<string>();
-  const re = new RegExp(`^${escapeRegex(messagesDir)}\\/c?(\\d+)\\/`);
-  for (const lower of index.keys()) {
-    const relative = prefix && lower.startsWith(prefix)
-      ? lower.slice(prefix.length)
-      : lower;
-    const m = re.exec(relative);
-    if (m) out.add(m[1]);
-  }
-  return out;
-}
-
-type ChannelFiles = {
-  channelJson: Uint8Array;
-  messagesEntry: Uint8Array;
-  messagesFormat: 'json' | 'csv';
-};
-
-function resolveChannelFiles(
-  files: Record<string, Uint8Array>,
-  index: CaseIndex,
-  prefix: string,
-  aliases: StructuralAliases,
-  channelId: string,
-): ChannelFiles | null {
-  const dirPrefixes = ['c', ''];
-  const formats: Array<'json' | 'csv'> = ['json', 'csv'];
-
-  for (const dp of dirPrefixes) {
-    const channelJson = resolveStructural(
-      files, index, prefix, aliases,
-      `messages/${dp}${channelId}/channel.json`,
-    );
-    if (!channelJson) continue;
-    for (const format of formats) {
-      const messagesEntry = resolveStructural(
-        files, index, prefix, aliases,
-        `messages/${dp}${channelId}/messages.${format}`,
-      );
-      if (messagesEntry) {
-        return { channelJson, messagesEntry, messagesFormat: format };
-      }
-    }
-  }
-  return null;
-}
-
-async function persistChannel(
-  files: Record<string, Uint8Array>,
-  index: CaseIndex,
-  prefix: string,
-  aliases: StructuralAliases,
-  id: string,
-  nameIndex: Record<string, string | null>,
-  guilds: PackageGuild[],
-  userId: string,
-): Promise<{ channel: PackageChannel; format: 'json' | 'csv' } | null> {
-  const resolved = resolveChannelFiles(files, index, prefix, aliases, id);
-  if (!resolved) return null;
-
-  let raw: RawChannelJson;
-  try {
-    raw = parseSnowflakeJson<RawChannelJson>(strFromU8(resolved.channelJson));
-  } catch {
-    return null;
-  }
-
-  const text = strFromU8(resolved.messagesEntry);
-  const messages = resolved.messagesFormat === 'json'
-    ? parseMessagesJson(text)
-    : parseMessagesCsv(text);
-  const messageCount = resolved.messagesFormat === 'json'
-    ? countJsonMessages(text)
-    : countCsvRows(text);
-
-  await storage.package.set(KEY_MSGS(userId, raw.id), messages);
-
-  const type = raw.type as PackageChannelType;
-  const guildId = raw.guild?.id;
-  const guildNameMap = new Map(guilds.map((g) => [g.id, g.name] as const));
-  const guildName = guildId
-    ? raw.guild?.name ?? guildNameMap.get(guildId) ?? undefined
-    : undefined;
-  const isOrphan = type === PACKAGE_CHANNEL_TYPE.GUILD_TEXT && !guildId;
-
-  return {
-    channel: {
-      id: raw.id,
-      type,
-      name: raw.name ?? nameIndex[raw.id] ?? null,
-      guildId,
-      guildName,
-      recipients: raw.recipients,
-      messageCount,
-      isOrphan,
-    },
-    format: resolved.messagesFormat,
-  };
-}
-
-/**
- * Read a Blob/File into an ArrayBuffer, retrying a transient NotReadableError.
- * That DOMException ("the requested file could not be read… permission problems
- * after a reference to a file was acquired") is often transient — an antivirus
- * scan or a cloud-synced folder briefly relocking the file. A short backoff and
- * re-read usually clears it. Non-NotReadableError failures throw immediately.
- * See backlog #203.
- */
-async function readBlobWithRetry(blob: Blob, attempts = 2): Promise<ArrayBuffer> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return await readBlobAsArrayBuffer(blob);
-    } catch (err) {
-      lastErr = err;
-      const name = (err as { name?: string })?.name;
-      if (name !== 'NotReadableError' || i === attempts - 1) throw err;
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
-  }
-  throw lastErr;
-}
-
-function readBlobAsArrayBuffer(blob: Blob): Promise<ArrayBuffer> {
-  if (typeof blob.arrayBuffer === 'function') {
-    return blob.arrayBuffer();
-  }
-  return new Promise<ArrayBuffer>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as ArrayBuffer);
-    reader.onerror = () => reject(reader.error ?? new Error('FileReader failed'));
-    reader.readAsArrayBuffer(blob);
-  });
-}
-
 function makeBlobUrl(blob: Blob): string | undefined {
   try {
     if (typeof URL === 'undefined' || !('createObjectURL' in URL)) return undefined;
@@ -712,10 +598,6 @@ function makeBlobUrl(blob: Blob): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 async function shouldHalt(
@@ -736,11 +618,4 @@ async function requestPersistentStorage(): Promise<void> {
   } catch {
     /* navigator.storage is best-effort; silent failure is fine */
   }
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }

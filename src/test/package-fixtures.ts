@@ -77,6 +77,33 @@ export interface FixtureOptions {
    * within channel.json — every field the helper claims to protect.
    */
   unquotedSnowflakes?: boolean;
+  /**
+   * #269: archive entry order. The streaming reader must not care where
+   * user.json or index.json sit, or which of a folder's two files comes
+   * first. `'default'` is Discord's layout (account first).
+   */
+  entryOrder?: 'default' | 'userLast' | 'indexAfterChannels' | 'messagesFirst';
+  /** #269: ship the activity entries stored (method 0) instead of deflated. */
+  includeStoredActivity?: boolean;
+  /**
+   * #269: overwrite the deflated activity entry's compressed bytes with
+   * garbage after zipping. Inflating it would throw, so a clean import
+   * proves the reader never inflated it. Implies `includeActivity`.
+   */
+  corruptActivityPayload?: boolean;
+  /** #269: emit messages.json rows with lower-case keys Discrub cannot store. */
+  renamedMessageKeys?: boolean;
+  /** #269: add this many one-byte entries under `programs/` (recursion guard). */
+  manyTinyEntries?: number;
+  /** #269: channel folders to break: which file to leave out, or an unreadable channel.json. */
+  brokenFolders?: Array<{ id: string; drop: 'channelJson' | 'messages' | 'unparsable' }>;
+  /**
+   * #270: what channel.json carries as `type` for channel 300 (the DM).
+   * A string like "DM" mimics newer exports; `null` omits the field.
+   */
+  dmTypeOverride?: string | number | null;
+  /** #270: an extra guild-less, recipient-less channel 700 with this raw type. */
+  extraChannelType?: string | number | null;
 }
 
 const HEADER = 'ID,Timestamp,Contents,Attachments';
@@ -136,6 +163,14 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
     messagesFormat = 'csv',
     includeAvatar = false,
     unquotedSnowflakes = false,
+    entryOrder = 'default',
+    includeStoredActivity = false,
+    corruptActivityPayload = false,
+    renamedMessageKeys = false,
+    manyTinyEntries = 0,
+    brokenFolders = [],
+    dmTypeOverride,
+    extraChannelType,
   } = opts;
   // Strips quotes from every snowflake-bearing field in a stringified
   // object so the on-disk wire shape mirrors what older Discord exports
@@ -183,8 +218,20 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
   // wrapper-dir prefix through directly rather than relying on a folder API.
   const z: Zippable = {};
   const root = wrapperDir ? `${wrapperDir}/` : '';
-  const put = (path: string, body: string | Uint8Array) => {
-    z[`${root}${path}`] = typeof body === 'string' ? strToU8(body) : body;
+  const put = (path: string, body: string | Uint8Array, stored = false) => {
+    const bytes = typeof body === 'string' ? strToU8(body) : body;
+    z[`${root}${path}`] = stored ? [bytes, { level: 0 }] : bytes;
+  };
+  // #269: a folder listed here loses one file, or gets an unreadable channel.json.
+  const broken = new Map(brokenFolders.map((b) => [b.id, b.drop] as const));
+  const putChannelJson = (id: string, path: string, body: string) => {
+    const drop = broken.get(id);
+    if (drop === 'channelJson') return;
+    put(path, drop === 'unparsable' ? '{ not json' : body);
+  };
+  const putMessages = (id: string, path: string, body: string) => {
+    if (broken.get(id) === 'messages') return;
+    put(path, body);
   };
 
   if (wrapperDir) {
@@ -192,7 +239,8 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
     z[`${wrapperDir}/.DS_Store`] = strToU8('junk');
   }
 
-  if (!omitUserJson) {
+  const putUserJson = () => {
+    if (omitUserJson) return;
     put(
       `${account}/user.json`,
       malformedUserJson
@@ -205,7 +253,8 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
             email: 'test@example.com',
           }),
     );
-  }
+  };
+  if (entryOrder !== 'userLast') putUserJson();
 
   if (includeAvatar) {
     // 8 bytes of "PNG-ish" magic + filler so the parser sees a non-empty
@@ -232,63 +281,78 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
     JSON.stringify({ '100': 'Test Guild' }),
   );
 
-  put(
-    `${messages}/index.json`,
-    JSON.stringify({
-      '200': 'general',
-      '300': 'Direct Message with friend#0',
-      '400': null,
-      '500': null,
-    }),
-  );
+  const putIndex = () =>
+    put(
+      `${messages}/index.json`,
+      JSON.stringify({
+        '200': 'general',
+        '300': 'Direct Message with friend#0',
+        '400': null,
+        '500': null,
+        '700': null,
+      }),
+    );
+  if (entryOrder !== 'indexAfterChannels') putIndex();
+
+  const generalRows = serializeMessages(messagesFormat, [
+    {
+      id: '1',
+      timestamp: '2022-07-28 22:30:52.800000+00:00',
+      contentsCsv: 'hello',
+      contentsJson: 'hello',
+      attachments: '',
+    },
+    {
+      id: '2',
+      timestamp: '2022-07-28 22:31:00.000000+00:00',
+      contentsCsv: '"with, comma"',
+      contentsJson: 'with, comma',
+      attachments: '',
+    },
+    {
+      id: '3',
+      timestamp: '2022-07-28 22:32:00.000000+00:00',
+      contentsCsv: '"multi\nline"',
+      contentsJson: 'multi\nline',
+      attachments: '',
+    },
+  ]);
+  // #269: rows Discord could rename one day: counted, never stored.
+  const generalBody = renamedMessageKeys
+    ? JSON.stringify([
+        { id: '1', timestamp: '2022-07-28 22:30:52.800000+00:00', contents: 'hello', attachments: '' },
+        { id: '2', timestamp: '2022-07-28 22:31:00.000000+00:00', contents: 'with, comma', attachments: '' },
+        { id: '3', timestamp: '2022-07-28 22:32:00.000000+00:00', contents: 'multi', attachments: '' },
+      ])
+    : generalRows;
+  const generalExt = renamedMessageKeys ? 'json' : msgExt;
 
   // Guild text channel
-  put(
-    `${messages}/${dirP}200/channel.json`,
-    stringify({
-      id: '200',
-      type: 0,
-      name: 'general',
-      guild: { id: '100', name: 'Test Guild' },
-    }),
-  );
-  put(
-    `${messages}/${dirP}200/messages.${msgExt}`,
-    serializeMessages(messagesFormat, [
-      {
-        id: '1',
-        timestamp: '2022-07-28 22:30:52.800000+00:00',
-        contentsCsv: 'hello',
-        contentsJson: 'hello',
-        attachments: '',
-      },
-      {
-        id: '2',
-        timestamp: '2022-07-28 22:31:00.000000+00:00',
-        contentsCsv: '"with, comma"',
-        contentsJson: 'with, comma',
-        attachments: '',
-      },
-      {
-        id: '3',
-        timestamp: '2022-07-28 22:32:00.000000+00:00',
-        contentsCsv: '"multi\nline"',
-        contentsJson: 'multi\nline',
-        attachments: '',
-      },
-    ]),
-  );
+  const generalChannelJson = stringify({
+    id: '200',
+    type: 0,
+    name: 'general',
+    guild: { id: '100', name: 'Test Guild' },
+  });
+  if (entryOrder === 'messagesFirst') {
+    putMessages('200', `${messages}/${dirP}200/messages.${generalExt}`, generalBody);
+    putChannelJson('200', `${messages}/${dirP}200/channel.json`, generalChannelJson);
+  } else {
+    putChannelJson('200', `${messages}/${dirP}200/channel.json`, generalChannelJson);
+    putMessages('200', `${messages}/${dirP}200/messages.${generalExt}`, generalBody);
+  }
 
   // DM
-  put(
-    `${messages}/${dirP}300/channel.json`,
-    stringify({
-      id: '300',
-      type: 1,
-      recipients: [userId, '999'],
-    }),
-  );
-  put(
+  const dmRaw: Record<string, unknown> = {
+    id: '300',
+    type: 1,
+    recipients: [userId, '999'],
+  };
+  if (dmTypeOverride === null) delete dmRaw.type;
+  else if (dmTypeOverride !== undefined) dmRaw.type = dmTypeOverride;
+  putChannelJson('300', `${messages}/${dirP}300/channel.json`, stringify(dmRaw));
+  putMessages(
+    '300',
     `${messages}/${dirP}300/messages.${msgExt}`,
     serializeMessages(messagesFormat, [
       {
@@ -301,12 +365,32 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
     ]),
   );
 
-  if (includeOrphanChannel) {
+  if (extraChannelType !== undefined) {
+    const extraRaw: Record<string, unknown> = { id: '700', name: 'mystery' };
+    if (extraChannelType !== null) extraRaw.type = extraChannelType;
+    put(`${messages}/${dirP}700/channel.json`, stringify(extraRaw));
     put(
+      `${messages}/${dirP}700/messages.${msgExt}`,
+      serializeMessages(messagesFormat, [
+        {
+          id: '30',
+          timestamp: '2022-09-01 00:00:00.000000+00:00',
+          contentsCsv: 'hm',
+          contentsJson: 'hm',
+          attachments: '',
+        },
+      ]),
+    );
+  }
+
+  if (includeOrphanChannel) {
+    putChannelJson(
+      '400',
       `${messages}/${dirP}400/channel.json`,
       stringify({ id: '400', type: 0 }),
     );
-    put(
+    putMessages(
+      '400',
       `${messages}/${dirP}400/messages.${msgExt}`,
       serializeMessages(messagesFormat, [
         {
@@ -321,7 +405,8 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
   }
 
   if (includeGroupDm) {
-    put(
+    putChannelJson(
+      '500',
       `${messages}/${dirP}500/channel.json`,
       stringify({
         id: '500',
@@ -329,7 +414,8 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
         recipients: [userId, '888', '777'],
       }),
     );
-    put(
+    putMessages(
+      '500',
       `${messages}/${dirP}500/messages.${msgExt}`,
       serializeMessages(messagesFormat, []),
     );
@@ -354,12 +440,54 @@ export async function buildFixturePackage(opts: FixtureOptions = {}): Promise<Bl
     );
   }
 
-  if (includeActivity) {
+  if (includeActivity || includeStoredActivity || corruptActivityPayload) {
     // Large payload that should NEVER be read into memory by the parser.
-    put(`${activity}/reporting.json`, 'x'.repeat(1024));
-    put(`${activitiesE}/events.json`, 'y'.repeat(512));
+    // Repeated text deflates to a few bytes, so use varied text: a
+    // corrupted deflate stream then has a body worth corrupting.
+    const filler = Array.from({ length: 512 }, (_, i) => `event-${i}-${(i * 7919) % 1000}`).join('\n');
+    put(`${activity}/reporting.json`, filler, includeStoredActivity);
+    put(`${activitiesE}/events.json`, 'y'.repeat(512), includeStoredActivity);
   }
 
+  for (let i = 0; i < manyTinyEntries; i++) {
+    put(`programs/p${i}.json`, '1', true);
+  }
+
+  if (entryOrder === 'indexAfterChannels') putIndex();
+  if (entryOrder === 'userLast') putUserJson();
+
   const bytes = zipSync(z);
+  if (corruptActivityPayload) {
+    corruptEntryPayload(bytes, `${root}${activity}/reporting.json`);
+  }
   return new Blob([bytes as BlobPart]);
+}
+
+/**
+ * Overwrites the compressed bytes of one entry (found by its local
+ * header) with garbage. fflate's zipSync writes sizes in the local
+ * header and no data descriptor, so the payload starts right after the
+ * header, file name and extra field.
+ */
+function corruptEntryPayload(bytes: Uint8Array, name: string): void {
+  const nameBytes = strToU8(name);
+  for (let i = 0; i + 30 + nameBytes.length <= bytes.length; i++) {
+    if (bytes[i] !== 0x50 || bytes[i + 1] !== 0x4b || bytes[i + 2] !== 0x03 || bytes[i + 3] !== 0x04) continue;
+    const fnl = bytes[i + 26] | (bytes[i + 27] << 8);
+    const es = bytes[i + 28] | (bytes[i + 29] << 8);
+    if (fnl !== nameBytes.length) continue;
+    let same = true;
+    for (let j = 0; j < fnl; j++) {
+      if (bytes[i + 30 + j] !== nameBytes[j]) {
+        same = false;
+        break;
+      }
+    }
+    if (!same) continue;
+    const compressedSize = bytes[i + 18] | (bytes[i + 19] << 8) | (bytes[i + 20] << 16) | (bytes[i + 21] << 24);
+    const start = i + 30 + fnl + es;
+    for (let k = 0; k < compressedSize; k++) bytes[start + k] = 0xff;
+    return;
+  }
+  throw new Error(`fixture entry not found: ${name}`);
 }

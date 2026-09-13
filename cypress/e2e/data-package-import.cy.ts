@@ -37,6 +37,18 @@ describe('Data package import', () => {
       cy.contains(/from a left server/i).should('be.visible');
     });
 
+    it('writes one status line saying what was read (#269)', () => {
+      cy.uploadPackage();
+      cy.contains(/3 channels/).should('be.visible');
+      cy.window().then((win) => {
+        const entries = (win as any).__store__.getState().status.entries as { level: string; message: string }[];
+        const lines = entries.filter((e) => e.message.startsWith('Package read:'));
+        expect(lines).to.have.length(1);
+        expect(lines[0].level).to.eq('info');
+        expect(lines[0].message).to.eq('Package read: 3 channels, 6 messages.');
+      });
+    });
+
     it('soft-warns on mismatched user and enters read-only mode', () => {
       cy.uploadPackage('test-package-mismatched.zip');
       cy.contains(/different user/i).should('be.visible');

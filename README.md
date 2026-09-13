@@ -151,10 +151,10 @@ Two HTML templates. **Discord Layout** (default) wraps the export in a Discord-l
 
 ### Purge
 
-Delete messages and reactions across one or more channels, with user targeting:
+Delete messages and reactions across one or more channels, with user targeting. If 25 requests in a row fail, the run pauses itself so you can check the log and resume or stop.
 
 - **Messages Mode**: search-based deletion with per-user targeting, plus an optional **"Also delete system messages"** section for chosen categories (pins, joins, boosts)
-- **Attachments Only**: strip attachments without deleting the text (own messages only, a Discord API limit)
+- **Attachments Only**: strip attachments without deleting the text (own messages only, a Discord API limit). The running count shows stripped and failed messages, and the status log says how many messages had no uploaded file
 - **Reactions Mode**: remove specific users' reactions from all messages (your own without permission, any user with Manage Messages)
 - **Clear All Reactions** (admin): one API call per message
 
@@ -221,7 +221,7 @@ Nine reports over the loaded messages: Overview (the headline numbers), Most men
 
 Import the ZIP from Discord's "Request All of My Data" export and browse, analyze, bulk-edit, bulk-delete or re-export your full message history, including servers you have left. Processing happens in your browser; the package file never leaves your device.
 
-The importer handles large packages (multi-gigabyte archives, tens of thousands of entries via ZIP64) and packages exported in any Discord locale (French, German, Spanish, Simplified Chinese, Cyrillic and others). Folder names vary by locale, so Discrub finds the account, messages and servers directories by their content. Multi-attachment messages render every attachment.
+The importer reads the ZIP in pieces, so a full package of several gigabytes opens without the file ever being loaded whole, and the Activity folders that make up most of it are skipped without being unpacked. A progress bar shows how much of the file has been read. Packages exported in any Discord locale (French, German, Spanish, Simplified Chinese, Cyrillic and others) work, and archives with tens of thousands of entries (ZIP64) too. Multi-attachment messages render every attachment. After an import the status log says how many channels and messages were read, and warns when a folder had to be skipped. Channels whose type Discord did not spell out are worked out from the rest of the record (recipients, server, name); anything that still cannot be placed is listed under Other.
 
 ![Package empty state](docs/screenshots/package/package-empty-state.png)
 
@@ -229,7 +229,7 @@ The importer handles large packages (multi-gigabyte archives, tens of thousands 
 
 ![Package analytics](docs/screenshots/package/package-analytics.png)
 
-**Browse the messages.** Imports decompress once into IndexedDB; per-channel reads come from IDB and never re-decompress the ZIP. Reload the page and the package resumes without a re-import. Messages render with markdown, mention chips, custom emoji and auto-linked URLs. Attachment placeholders keep the original CDN URL. Older packages with unquoted snowflake IDs parse without precision loss across user, server, channel and message metadata.
+**Browse the messages.** Imports decompress once into IndexedDB; per-channel reads come from IDB and never re-decompress the ZIP. Deleting from a package tells 404s apart from real deletions: messages that were already gone on Discord (removed earlier by a live purge, for example) are counted as "already gone", wait only a short moment instead of the full delete delay, and a run that removed nothing ends on a warning. Messages you delete with the live Purge or from the message list are remembered for the loaded package, so a later package purge skips them. Reload the page and the package resumes without a re-import. Messages render with markdown, mention chips, custom emoji and auto-linked URLs. Attachment placeholders keep the original CDN URL. Older packages with unquoted snowflake IDs parse without precision loss across user, server, channel and message metadata.
 
 **Filter package messages.** A Filter button above the package message table opens a FilterModal with Content and Date controls that applies locally, without touching the network. The header shows the filtered count above the total, and exports honor the active filter. After "Load rich data", reaction emoji chips are clickable and open the live ReactionModal to show who reacted (with a Discord token; without one the modal shows "User list not available").
 

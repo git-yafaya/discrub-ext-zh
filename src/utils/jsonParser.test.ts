@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseMessagesJson, countJsonMessages, parseSnowflakeJson } from './jsonParser';
+import { parseMessagesJson, parseMessagesJsonDetailed, parseSnowflakeJson } from './jsonParser';
 
 describe('parseMessagesJson', () => {
   it('parses a simple row', () => {
@@ -233,26 +233,33 @@ describe('parseSnowflakeJson', () => {
   });
 });
 
-describe('countJsonMessages', () => {
-  it('counts array length', () => {
+describe('parseMessagesJsonDetailed (#269)', () => {
+  it('reports the raw array length alongside the stored rows', () => {
     const json = JSON.stringify([
       { ID: '1', Timestamp: 't', Contents: 'a', Attachments: '' },
       { ID: '2', Timestamp: 't', Contents: 'b', Attachments: '' },
       { ID: '3', Timestamp: 't', Contents: 'c', Attachments: '' },
     ]);
-    expect(countJsonMessages(json)).toBe(3);
+    const result = parseMessagesJsonDetailed(json);
+    expect(result.rawCount).toBe(3);
+    expect(result.messages).toHaveLength(3);
+    expect(result.sampleDroppedKeys).toBeNull();
   });
 
-  it('returns 0 for empty arrays', () => {
-    expect(countJsonMessages('[]')).toBe(0);
+  it('counts renamed-key rows but stores none, and keeps a key sample', () => {
+    const json = JSON.stringify([
+      { id: '1', timestamp: 't', contents: 'a' },
+      { id: '2', timestamp: 't', contents: 'b' },
+    ]);
+    const result = parseMessagesJsonDetailed(json);
+    expect(result.rawCount).toBe(2);
+    expect(result.messages).toEqual([]);
+    expect(result.sampleDroppedKeys).toEqual(['id', 'timestamp', 'contents']);
   });
 
-  it('returns 0 for malformed JSON', () => {
-    expect(countJsonMessages('{ not json')).toBe(0);
-  });
-
-  it('returns 0 when the root is not an array', () => {
-    expect(countJsonMessages('{}')).toBe(0);
-    expect(countJsonMessages('"hello"')).toBe(0);
+  it('returns zero for empty arrays, malformed JSON, and non-array roots', () => {
+    expect(parseMessagesJsonDetailed('[]')).toEqual({ messages: [], rawCount: 0, sampleDroppedKeys: null });
+    expect(parseMessagesJsonDetailed('{ not json')).toEqual({ messages: [], rawCount: 0, sampleDroppedKeys: null });
+    expect(parseMessagesJsonDetailed('{}')).toEqual({ messages: [], rawCount: 0, sampleDroppedKeys: null });
   });
 });

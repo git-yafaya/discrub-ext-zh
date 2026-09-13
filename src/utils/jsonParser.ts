@@ -97,49 +97,53 @@ export function parseSnowflakeJson<T = unknown>(text: string): T {
   return JSON.parse(quoteSnowflakeJsonFields(text)) as T;
 }
 
-export function parseMessagesJson(text: string): PackageMessage[] {
+export interface ParsedMessagesJson {
+  /** Rows that carried both `ID` and `Timestamp`. */
+  messages: PackageMessage[];
+  /** Length of the raw array, whatever the rows looked like. */
+  rawCount: number;
+  /**
+   * Key names of the first row that was dropped for missing `ID` or
+   * `Timestamp`, so an import can say what Discord actually shipped
+   * when a channel parses to zero rows (#269). Null when nothing dropped.
+   */
+  sampleDroppedKeys: string[] | null;
+}
+
+/**
+ * One `JSON.parse` per channel (#269): the raw array length is the
+ * channel's message count, the rows that carry `ID` and `Timestamp`
+ * are what gets stored. A renamed-key file therefore reports its
+ * count and stores nothing, and the import can say so.
+ */
+export function parseMessagesJsonDetailed(text: string): ParsedMessagesJson {
   let parsed: unknown;
   try {
     parsed = JSON.parse(quoteNumericIds(text));
   } catch {
-    return [];
+    return { messages: [], rawCount: 0, sampleDroppedKeys: null };
   }
-  if (!Array.isArray(parsed)) return [];
-  return parsed
-    .filter(
-      (row): row is Record<string, unknown> =>
-        typeof row === 'object' &&
-        row !== null &&
-        'ID' in row &&
-        'Timestamp' in row,
-    )
-    .map((row) => ({
-      id: String(row.ID),
-      timestamp: String(row.Timestamp),
-      content: typeof row.Contents === 'string' ? row.Contents : '',
-      attachments: parseAttachmentCell(
-        typeof row.Attachments === 'string' ? row.Attachments : undefined,
-      ),
-    }));
+  if (!Array.isArray(parsed)) return { messages: [], rawCount: 0, sampleDroppedKeys: null };
+  const messages: PackageMessage[] = [];
+  let sampleDroppedKeys: string[] | null = null;
+  for (const row of parsed) {
+    if (typeof row === 'object' && row !== null && 'ID' in row && 'Timestamp' in row) {
+      const r = row as Record<string, unknown>;
+      messages.push({
+        id: String(r.ID),
+        timestamp: String(r.Timestamp),
+        content: typeof r.Contents === 'string' ? r.Contents : '',
+        attachments: parseAttachmentCell(
+          typeof r.Attachments === 'string' ? r.Attachments : undefined,
+        ),
+      });
+    } else if (sampleDroppedKeys === null && typeof row === 'object' && row !== null) {
+      sampleDroppedKeys = Object.keys(row as Record<string, unknown>);
+    }
+  }
+  return { messages, rawCount: parsed.length, sampleDroppedKeys };
 }
 
-/**
- * Counts message rows in a messages.json without retaining the parsed
- * objects. Mirrors `countCsvRows` (csvParser.ts) — used during the initial
- * package scan to populate `messageCount` per channel before the user
- * actually opens a channel.
- *
- * Discord's array shape forces a full parse here (no streaming row count
- * the way CSV permits), but the cost is bounded: the bytes are already
- * decoded to a string by the time this is called, and the parsed array
- * is discarded immediately. If profiles ever flag this on very large
- * channels, swap to a streaming JSON tokenizer.
- */
-export function countJsonMessages(text: string): number {
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed.length : 0;
-  } catch {
-    return 0;
-  }
+export function parseMessagesJson(text: string): PackageMessage[] {
+  return parseMessagesJsonDetailed(text).messages;
 }

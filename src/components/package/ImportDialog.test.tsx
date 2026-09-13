@@ -64,4 +64,40 @@ describe('<ImportDialog />', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toMatch(/user\.json|missing|failed/i);
   });
+
+
+  it('hands the File to the import unread (#269)', async () => {
+    const { store } = renderWithProviders(<ImportDialog open onClose={() => {}} />);
+    const blob = await buildFixturePackage();
+    const file = new File([blob], 'package.zip', { type: 'application/zip' });
+    const arrayBufferSpy = vi.spyOn(file, 'arrayBuffer');
+
+    const input = screen.getByTestId('package-file-input') as HTMLInputElement;
+    Object.defineProperty(input, 'files', { value: [file] });
+    fireEvent.change(input);
+
+    await waitFor(() => {
+      expect(store.getState().package.status).toBe('ready');
+    });
+    expect(arrayBufferSpy).not.toHaveBeenCalled();
+  });
+
+  it('shows a determinate bar while bytes are being read (#269)', () => {
+    renderWithProviders(<ImportDialog open onClose={() => {}} />, {
+      preloadedState: {
+        package: {
+          status: 'parsing',
+          importProgress: { read: 25, total: 100 },
+        },
+      } as never,
+    });
+    const bar = screen.getByTestId('package-import-progress');
+    expect(bar).toHaveAttribute('aria-valuenow', '25');
+    expect(screen.getByText(/Reading package… 25%/)).toBeInTheDocument();
+  });
+
+  it('maps a storage quota failure to plain copy (#269)', () => {
+    expect(friendlyImportError('QuotaExceededError: The quota has been exceeded.')).toMatch(/enough storage space/i);
+    expect(friendlyImportError('The requested file could not be read')).not.toMatch(/very large/);
+  });
 });

@@ -8,6 +8,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  LinearProgress,
   Typography,
 } from '@mui/material';
 import {
@@ -18,6 +19,7 @@ import DialogCloseIcon from '@components/ui/DialogCloseIcon';
 import { useAppDispatch, useAppSelector } from '@/app/hooks';
 import {
   importPackage,
+  selectImportProgress,
   selectPackageError,
   selectPackageStatus,
 } from '@features/package/packageSlice';
@@ -50,7 +52,11 @@ export function friendlyImportError(raw: string): string {
     lower.includes('permission problems')
   ) {
     // #203: stale/locked file-descriptor read failure.
-    return 'Couldn’t read the ZIP file. Make sure it isn’t open in another program, then try again. If it’s very large or kept in a cloud-synced folder (OneDrive, iCloud, Dropbox), copy it to your Desktop first.';
+    return 'Couldn’t read the ZIP file. Make sure it isn’t open in another program, then try again. If it’s kept in a cloud-synced folder (OneDrive, iCloud, Dropbox), copy it to your Desktop first.';
+  }
+  if (lower.includes('quotaexceeded') || lower.includes('exceeded the quota') || lower.includes('not enough space')) {
+    // #269: IndexedDB refused the write.
+    return 'Your browser does not have enough storage space for this package. Free up disk space or close the package you already have loaded, then try again.';
   }
   return raw;
 }
@@ -59,6 +65,7 @@ const ImportDialog = ({ open, onClose, onImported }: ImportDialogProps) => {
   const dispatch = useAppDispatch();
   const status = useAppSelector(selectPackageStatus);
   const error = useAppSelector(selectPackageError);
+  const importProgress = useAppSelector(selectImportProgress);
   const inputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
 
@@ -66,19 +73,11 @@ const ImportDialog = ({ open, onClose, onImported }: ImportDialogProps) => {
 
   const handleFile = useCallback(
     async (file: File) => {
-      // #203: read the bytes the instant the file is selected, while the OS
-      // file descriptor is still fresh, instead of several async hops later
-      // inside the parse pipeline (where a synced/locked/large-file handle can
-      // go stale → NotReadableError). Best-effort: if the eager read itself
-      // throws, fall back to passing the File so the pipeline's retrying read
-      // gets a shot and surfaces any error through the normal channel.
-      let payload: File | ArrayBuffer = file;
-      try {
-        payload = await file.arrayBuffer();
-      } catch {
-        payload = file;
-      }
-      const result = await dispatch(importPackage(payload));
+      // #269: the File goes to the import as-is. The reader streams it
+      // in chunks, so a multi-GB package never has to fit in one buffer
+      // (Chrome refuses `arrayBuffer()` past about 2 GiB) and a flaky
+      // read (#203) is retried inside the import.
+      const result = await dispatch(importPackage(file));
       if (importPackage.fulfilled.match(result)) {
         onImported?.();
         onClose();
@@ -148,9 +147,21 @@ const ImportDialog = ({ open, onClose, onImported }: ImportDialogProps) => {
         >
           {isParsing ? (
             <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
-              <CircularProgress size={32} />
+              {importProgress && importProgress.total > 0 ? (
+                <Box sx={{ width: '100%', maxWidth: 360 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={Math.min(100, Math.round((importProgress.read / importProgress.total) * 100))}
+                    data-testid="package-import-progress"
+                  />
+                </Box>
+              ) : (
+                <CircularProgress size={32} />
+              )}
               <Typography variant="body2" color="text.secondary">
-                Parsing package…
+                {importProgress && importProgress.total > 0
+                  ? `Reading package… ${Math.min(100, Math.round((importProgress.read / importProgress.total) * 100))}%`
+                  : 'Parsing package…'}
               </Typography>
             </Box>
           ) : (

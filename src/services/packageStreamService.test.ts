@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, beforeAll, vi } from 'vitest';
 import {
   streamPackageToStorage,
+  importPackageToStorage,
   loadChannelMessagesFromStorage,
   resumePackageFromStorage,
   clearPackageContents,
@@ -8,7 +9,7 @@ import {
   PackageStreamCancelledError,
   PKG_SCHEMA_VERSION,
 } from './packageStreamService';
-import { PackageParseError } from './packageParseService';
+import { PackageParseError } from './packageValidation';
 import { storage } from '@/extension/storage';
 import { buildFixturePackage } from '@/test/package-fixtures';
 import * as fflate from 'fflate';
@@ -19,9 +20,16 @@ import * as fflate from 'fflate';
 // worker-backed async `unzip` — the latter structured-clones each entry across
 // postMessage and OOMs ("Data cannot be cloned" / "Array buffer allocation
 // failed") on multi-GB packages. See backlog #210/#203/#162.
+let unzipConstructions = 0;
 vi.mock('fflate', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fflate')>();
-  return { ...actual, unzipSync: vi.fn(actual.unzipSync), unzip: vi.fn(actual.unzip) };
+  class CountingUnzip extends actual.Unzip {
+    constructor(...args: ConstructorParameters<typeof actual.Unzip>) {
+      super(...args);
+      unzipConstructions++;
+    }
+  }
+  return { ...actual, Unzip: CountingUnzip, unzipSync: vi.fn(actual.unzipSync), unzip: vi.fn(actual.unzip) };
 });
 
 // jsdom does not implement URL.createObjectURL. Stub it with a counter-keyed
@@ -56,14 +64,16 @@ describe('streamPackageToStorage', () => {
       expect(parsed.totalMessages).toBe(4);
     });
 
-    it('decompresses with synchronous unzipSync, never the worker-backed async unzip (#210 OOM guard)', async () => {
+    it('reads through the streaming Unzip, never unzipSync or the worker-backed unzip (#269, #210)', async () => {
       const blob = await buildFixturePackage();
+      vi.mocked(fflate.unzipSync).mockClear();
+      vi.mocked(fflate.unzip).mockClear();
+      unzipConstructions = 0;
       await streamPackageToStorage(blob);
-
-      expect(vi.mocked(fflate.unzipSync)).toHaveBeenCalled();
-      // The async API is worker-backed and OOMs on large archives — it must
-      // stay out of the import path so the #210 fix can't silently regress.
-      expect(vi.mocked(fflate.unzip)).not.toHaveBeenCalled();
+      expect(fflate.unzipSync).not.toHaveBeenCalled();
+      expect(fflate.unzip).not.toHaveBeenCalled();
+      // Two passes: one to find user.json, one for everything else.
+      expect(unzipConstructions).toBe(2);
     });
 
     it('writes pkg:meta:{userId} as the commit marker, last', async () => {
@@ -449,33 +459,6 @@ describe('streamPackageToStorage', () => {
       }
     });
   });
-
-  describe('compressed-size telemetry warning', () => {
-    it('does not warn under 1 GiB compressed', async () => {
-      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const blob = await buildFixturePackage();
-      await streamPackageToStorage(blob);
-      expect(consoleSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining('[packageStream]'),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it('warns when compressed size exceeds 1 GiB', async () => {
-      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      const blob = await buildFixturePackage();
-      // Override the size getter to simulate a large compressed package
-      // without actually building one. The streamer reads `file.size` for
-      // the threshold check.
-      Object.defineProperty(blob, 'size', { value: 2 * 1024 * 1024 * 1024 });
-
-      await streamPackageToStorage(blob);
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining('[packageStream]'),
-      );
-      consoleSpy.mockRestore();
-    });
-  });
 });
 
 describe('loadChannelMessagesFromStorage', () => {
@@ -618,5 +601,228 @@ describe('clearPackageContents', () => {
 
     expect(await storage.package.get('enriched:u:c')).toEqual({ foo: 1 });
     expect(await storage.package.get('deleted:u')).toEqual({});
+  });
+});
+
+
+describe('importPackageToStorage — streaming reader (#269)', () => {
+  beforeEach(async () => {
+    await storage.package.clear();
+  });
+
+  const readBlobBytes = (b: Blob): Promise<ArrayBuffer> =>
+    new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result as ArrayBuffer);
+      r.onerror = () => reject(r.error ?? new Error('read failed'));
+      r.readAsArrayBuffer(b);
+    });
+
+  describe('entry order does not matter', () => {
+    it('finds user.json when it is the last entry', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ entryOrder: 'userLast' }));
+      expect(parsed.user.id).toBe('253286221395001345');
+      expect(parsed.channels).toHaveLength(2);
+    });
+
+    it('resolves names from an index.json that arrives after the channels', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ entryOrder: 'indexAfterChannels' }));
+      const dm = parsed.channels.find((c) => c.id === '300');
+      expect(dm?.name).toBe('Direct Message with friend#0');
+    });
+
+    it('accepts messages.json before channel.json inside one folder', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ entryOrder: 'messagesFirst' }));
+      expect(parsed.channels.find((c) => c.id === '200')?.messageCount).toBe(3);
+      const rows = await storage.package.get<unknown[]>('pkg:msgs:253286221395001345:200');
+      expect(rows).toHaveLength(3);
+    });
+
+    it('reads the same package through tiny pushes', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage(), { chunkSize: 7 });
+      expect(parsed.totalMessages).toBe(4);
+    });
+  });
+
+  describe('dropped folders and diagnostics', () => {
+    it('counts folders missing one file or with an unreadable channel.json, by reason', async () => {
+      const blob = await buildFixturePackage({
+        includeOrphanChannel: true,
+        includeGroupDm: true,
+        brokenFolders: [
+          { id: '200', drop: 'messages' },
+          { id: '300', drop: 'channelJson' },
+          { id: '400', drop: 'unparsable' },
+        ],
+      });
+      const { parsed, diagnostics } = await importPackageToStorage(blob);
+      expect(parsed.channels.map((c) => c.id)).toEqual(['500']);
+      expect(diagnostics.droppedMissingMessages).toBe(1);
+      expect(diagnostics.droppedMissingChannelJson).toBe(1);
+      expect(diagnostics.droppedUnparsableChannelJson).toBe(1);
+      expect(diagnostics.channelFoldersSeen).toBe(4);
+      expect(diagnostics.channelsBuilt).toBe(1);
+    });
+
+    it('reports renamed message keys as counted but not stored, with a key sample', async () => {
+      const { parsed, diagnostics } = await importPackageToStorage(await buildFixturePackage({ renamedMessageKeys: true }));
+      const general = parsed.channels.find((c) => c.id === '200');
+      expect(general?.messageCount).toBe(3);
+      const rows = await storage.package.get<unknown[]>('pkg:msgs:253286221395001345:200');
+      expect(rows).toEqual([]);
+      expect(diagnostics.channelsWithNoStoredRows).toBe(1);
+      expect(diagnostics.sampleRowKeys).toEqual(['id', 'timestamp', 'contents', 'attachments']);
+    });
+
+    it('reports a clean package with zero drops and the bytes it read', async () => {
+      const blob = await buildFixturePackage();
+      const { diagnostics } = await importPackageToStorage(blob);
+      expect(diagnostics.droppedMissingChannelJson + diagnostics.droppedMissingMessages + diagnostics.droppedUnparsableChannelJson).toBe(0);
+      expect(diagnostics.channelsWithNoStoredRows).toBe(0);
+      expect(diagnostics.channelsBuilt).toBe(2);
+      expect(diagnostics.bytesRead).toBe(blob.size);
+      expect(diagnostics.entriesSeen).toBeGreaterThan(5);
+    });
+  });
+
+  describe('never inflates what it does not need', () => {
+    it('imports cleanly when the deflated Activity entry is corrupt', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ corruptActivityPayload: true }));
+      expect(parsed.totalMessages).toBe(4);
+    });
+
+    it('imports cleanly past stored Activity entries and thousands of tiny entries', async () => {
+      const parsed = await streamPackageToStorage(
+        await buildFixturePackage({ includeStoredActivity: true, manyTinyEntries: 2500 }),
+      );
+      expect(parsed.totalMessages).toBe(4);
+    });
+  });
+
+  describe('flaky sources', () => {
+    const notReadable = () => {
+      const err = new Error('The requested file could not be read');
+      err.name = 'NotReadableError';
+      return err;
+    };
+
+    it('retries once when the stream fails with NotReadableError mid-read', async () => {
+      const bytes = new Uint8Array(await readBlobBytes(await buildFixturePackage()));
+      let opens = 0;
+      const flaky = {
+        size: bytes.length,
+        stream: () => {
+          opens++;
+          const failThisOpen = opens === 1;
+          let sent = false;
+          return new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (failThisOpen) throw notReadable();
+              if (sent) {
+                controller.close();
+                return;
+              }
+              sent = true;
+              controller.enqueue(bytes);
+            },
+          });
+        },
+      } as unknown as File;
+
+      const parsed = await streamPackageToStorage(flaky);
+      expect(parsed.user.id).toBe('253286221395001345');
+      // Failed open, then pass 1 and pass 2 on fresh streams.
+      expect(opens).toBe(3);
+    });
+
+    it('gives up after the second NotReadableError and leaves no pkg:* keys', async () => {
+      const bytes = new Uint8Array(await readBlobBytes(await buildFixturePackage()));
+      let opens = 0;
+      const flaky = {
+        size: bytes.length,
+        stream: () => {
+          opens++;
+          // Pass 1 succeeds (user.json is early); pass 2 fails every time.
+          const fail = opens % 2 === 0;
+          let sent = false;
+          return new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (fail && sent) throw notReadable();
+              if (sent) {
+                controller.close();
+                return;
+              }
+              sent = true;
+              controller.enqueue(bytes.subarray(0, 400));
+              if (!fail) controller.enqueue(bytes.subarray(400));
+            },
+          });
+        },
+      } as unknown as File;
+
+      await expect(streamPackageToStorage(flaky)).rejects.toMatchObject({ name: 'NotReadableError' });
+      const keys = (await storage.package.keys()).filter((k) => k.startsWith('pkg:') && k !== 'pkg:schema-version');
+      expect(keys).toEqual([]);
+    });
+
+    it('onBytes climbs to the total', async () => {
+      const blob = await buildFixturePackage();
+      const ticks: Array<[number, number]> = [];
+      await streamPackageToStorage(blob, { onBytes: (read, total) => ticks.push([read, total]) });
+      expect(ticks[ticks.length - 1]).toEqual([blob.size, blob.size]);
+    });
+  });
+
+  describe('channel type resolution (#270)', () => {
+    it('accepts a named type string from a newer export', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ dmTypeOverride: 'DM' }));
+      const dm = parsed.channels.find((c) => c.id === '300');
+      expect(dm?.type).toBe(1);
+      expect(dm?.isOrphan).toBe(false);
+    });
+
+    it('accepts a numeric string type', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ dmTypeOverride: '1' }));
+      expect(parsed.channels.find((c) => c.id === '300')?.type).toBe(1);
+    });
+
+    it('infers a DM from two recipients and no guild when type is missing', async () => {
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ dmTypeOverride: null }));
+      const dm = parsed.channels.find((c) => c.id === '300');
+      expect(dm?.type).toBe(1);
+      expect(dm?.isOrphan).toBe(false);
+    });
+
+    it('infers a group DM from three recipients when the type is unrecognised', async () => {
+      const parsed = await streamPackageToStorage(
+        await buildFixturePackage({ includeGroupDm: true, dmTypeOverride: 'nonsense' }),
+      );
+      // Channel 500 keeps type 3 from its own json; channel 300 gets inferred from two recipients.
+      expect(parsed.channels.find((c) => c.id === '300')?.type).toBe(1);
+      expect(parsed.channels.find((c) => c.id === '500')?.type).toBe(3);
+    });
+
+    it('infers a DM from the index label when there is nothing else to go on', async () => {
+      // The fixture's index.json labels 300 "Direct Message with friend#0".
+      const parsed = await streamPackageToStorage(await buildFixturePackage({ dmTypeOverride: null }));
+      expect(parsed.channels.find((c) => c.id === '300')?.type).toBe(1);
+    });
+
+    it('marks a channel with no type, guild, recipients, or label as UNKNOWN and counts it', async () => {
+      const { parsed, diagnostics } = await importPackageToStorage(await buildFixturePackage({ extraChannelType: null }));
+      const mystery = parsed.channels.find((c) => c.id === '700');
+      expect(mystery?.type).toBe(-1);
+      expect(mystery?.isOrphan).toBe(false);
+      expect(diagnostics.unrecognizedTypes).toBe(1);
+    });
+
+    it('keeps an orphan only for guild-type channels without a guild', async () => {
+      const parsed = await streamPackageToStorage(
+        await buildFixturePackage({ includeOrphanChannel: true, extraChannelType: 'GUILD_TEXT' }),
+      );
+      expect(parsed.channels.find((c) => c.id === '400')?.isOrphan).toBe(true);
+      expect(parsed.channels.find((c) => c.id === '700')?.isOrphan).toBe(true);
+      expect(parsed.channels.find((c) => c.id === '300')?.isOrphan).toBe(false);
+    });
   });
 });
