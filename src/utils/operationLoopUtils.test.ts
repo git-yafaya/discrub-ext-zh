@@ -341,8 +341,9 @@ describe('retry wait setting (#265)', () => {
   });
 });
 
-const setOnline = (online: boolean) =>
+const setOnline = (online: boolean) => {
   Object.defineProperty(navigator, 'onLine', { value: online, configurable: true });
+};
 
 describe('thrown fetches while online (GH #14 refused requests)', () => {
   afterEach(() => setOnline(true));

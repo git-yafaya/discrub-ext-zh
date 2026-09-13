@@ -3,8 +3,9 @@ import { createTestStore, TestStore } from '@/test/test-utils';
 
 // A status-less failure only counts as "the network" while the browser is
 // offline; online it is a refused request and stops instead of pausing.
-const setOnline = (online: boolean) =>
+const setOnline = (online: boolean) => {
   Object.defineProperty(navigator, 'onLine', { value: online, configurable: true });
+};
 afterEach(() => setOnline(true));
 
 import messageReducer, {
