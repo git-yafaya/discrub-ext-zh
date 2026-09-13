@@ -46,6 +46,12 @@ export function formatDeleteSummary(result: DeleteResult): string {
     // Defensive fallback. The thunk rejects before reaching this state
     // so it shouldn't render in practice, but keeps the formatter total.
     parts.push(t('packageCopy.noneDeleted'));
+  } else if (result.alreadyGone > 0 && result.forbidden === 0 && result.failed === 0) {
+    // #271: every message was already gone before this run. Say that
+    // plainly instead of "Couldn't delete" followed by the reason.
+    let sentence = t('packageCopy.allGone', { count: result.alreadyGone, messages: messages(result.alreadyGone) });
+    if (result.cancelled) sentence += t('packageCopy.cancelledSuffix');
+    return sentence;
   } else {
     parts.push(t('packageCopy.couldNotDelete'));
   }
@@ -69,6 +75,35 @@ export function formatDeleteSummary(result: DeleteResult): string {
   let sentence = parts.join(' ');
   if (result.cancelled) sentence += t('packageCopy.cancelledSuffix');
   return sentence;
+}
+
+/**
+ * #271: the tooltip behind a remaining-count chip. `gone` is the part of
+ * `deleted` that Discrub never actually removed (the message was already
+ * gone when it was tried), so the "deleted via Discrub" figure excludes it.
+ */
+export function formatProvenanceTooltip(total: number, deleted: number, gone: number): string {
+  const viaDiscrub = Math.max(deleted - gone, 0);
+  if (gone > 0) {
+    return t('package.inPackageDeletedGone', {
+      total: total.toLocaleString(),
+      deleted: viaDiscrub.toLocaleString(),
+      gone: gone.toLocaleString(),
+    });
+  }
+  return t('package.inPackageDeleted', { total: total.toLocaleString(), deleted: deleted.toLocaleString() });
+}
+
+/**
+ * #271: the status-log level and Alert severity for a delete summary.
+ * Errors and a run that removed nothing (every answer 404) both warrant
+ * a warning; a run that deleted something is a success even if a few
+ * were already gone.
+ */
+export function deleteSummaryLevel(result: DeleteResult): 'success' | 'warning' {
+  if (result.failed > 0) return 'warning';
+  if (result.deleted === 0 && result.alreadyGone > 0) return 'warning';
+  return 'success';
 }
 
 /**

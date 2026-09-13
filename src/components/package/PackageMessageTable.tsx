@@ -45,6 +45,7 @@ import {
   selectAllChannelMessages,
   selectActiveEnrichmentChannelId,
   selectChannelDeletedMessageIds,
+  selectChannelGoneMessageIds,
   selectChannelEnrichedMessages,
   selectChannelEnrichmentLastFetched,
   selectChannelEnrichmentMisses,
@@ -76,6 +77,7 @@ import type { SearchCriteria } from 'discrub-core/types/discrub-types';
 import { FilterList as FilterIcon } from '@mui/icons-material';
 import {
   formatDeleteSummary,
+  deleteSummaryLevel,
   formatRehydrateEta,
   formatRehydrateEtaBreakdown,
   formatRehydrateInlineSummary,
@@ -99,6 +101,13 @@ import { fetchReactingUsers } from '@features/message/messageSlice';
 import { t as translate } from '@/i18n';
 import { useTranslation } from 'react-i18next';
 
+/**
+ * #271: the delete confirm dialog suggests rehydrating first once the
+ * selection is large enough that a stale run (messages the live purge
+ * already removed) would waste real time.
+ */
+const REHYDRATE_HINT_MIN_SELECTION = 100;
+
 interface PackageMessageTableProps {
   channel: PackageChannel;
 }
@@ -111,6 +120,8 @@ const PackageMessageTable = ({ channel }: PackageMessageTableProps) => {
   const parsed = useAppSelector(selectParsedPackage);
   const messages = useAppSelector(selectPackageChannelMessages(channel.id));
   const deletedIds = useAppSelector(selectChannelDeletedMessageIds(channel.id));
+  // #271: the part of `deletedIds` that was already gone when Discrub tried it.
+  const goneIds = useAppSelector(selectChannelGoneMessageIds(channel.id));
   const isLoading = useAppSelector(selectIsPackageChannelLoading);
   const selectedIds = useAppSelector(selectChannelSelectedMessageIds(channel.id));
   const readOnly = useAppSelector(selectIsPackageReadOnly);
@@ -531,7 +542,9 @@ const PackageMessageTable = ({ channel }: PackageMessageTableProps) => {
               color="warning.main"
               sx={{ ml: 1 }}
             >
-              {t('pkgTable.previouslyDeleted', { count: deletedIds.length })}
+              {goneIds.length > 0
+                ? t('pkgTable.goneFromDiscord', { count: deletedIds.length })
+                : t('pkgTable.previouslyDeleted', { count: deletedIds.length })}
             </Typography>
           )}
         </Typography>
@@ -607,7 +620,7 @@ const PackageMessageTable = ({ channel }: PackageMessageTableProps) => {
 
       {deleteResult && (
         <Alert
-          severity={deleteResult.failed > 0 ? 'warning' : 'success'}
+          severity={deleteSummaryLevel(deleteResult)}
           sx={{ mb: 1 }}
           onClose={() => dispatch(dismissDeleteResult())}
         >
@@ -782,6 +795,11 @@ const PackageMessageTable = ({ channel }: PackageMessageTableProps) => {
           <Typography variant="body2" color="text.secondary" sx={{ py: 1 }}>
             {t('pkgTable.confirmBody')}
           </Typography>
+          {enrichmentStatus === 'idle' && selectedIds.length > REHYDRATE_HINT_MIN_SELECTION && (
+            <Alert severity="info" sx={{ mt: 1 }} data-testid="package-delete-rehydrate-hint">
+              {t('pkgTable.staleSelectionHint', { eta: formatRehydrateEta(selectedIds.length, searchDelay) })}
+            </Alert>
+          )}
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2 }}>
           <Button onClick={() => setConfirmOpen(false)}>{t('pkgTable.cancel')}</Button>

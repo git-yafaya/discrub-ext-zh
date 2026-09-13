@@ -5,6 +5,8 @@ import {
   formatRehydrateEtaBreakdown,
   formatRehydrateInlineSummary,
   formatRehydrateLogSummary,
+  deleteSummaryLevel,
+  formatProvenanceTooltip,
 } from './packageStatusCopy';
 import type { DeleteResult } from './packageSlice';
 
@@ -14,7 +16,8 @@ const baseDeleteResult: DeleteResult = {
   forbidden: 0,
   failed: 0,
   cancelled: false,
-  confirmedGoneIds: [],
+  deletedIds: [],
+  alreadyGoneIds: [],
 };
 
 describe('formatDeleteSummary', () => {
@@ -235,5 +238,49 @@ describe('formatRehydrateEtaBreakdown (Backlog #174)', () => {
     // 5000ms delay = 1 message every 5 seconds
     const out = formatRehydrateEtaBreakdown(10, 5000);
     expect(out).toMatch(/5\.0s per message/);
+  });
+
+
+  describe('#271 already-gone runs', () => {
+    it('says nothing was deleted when every message was already gone', () => {
+      expect(formatDeleteSummary({ ...baseDeleteResult, alreadyGone: 3 })).toBe(
+        'Nothing to delete. All 3 messages were already gone on Discord.',
+      );
+      expect(formatDeleteSummary({ ...baseDeleteResult, alreadyGone: 1 })).toBe(
+        'Nothing to delete. 1 message was already gone on Discord.',
+      );
+    });
+
+    it('keeps the cancelled suffix on the all-gone sentence', () => {
+      expect(formatDeleteSummary({ ...baseDeleteResult, alreadyGone: 2, cancelled: true })).toBe(
+        'Nothing to delete. All 2 messages were already gone on Discord. (cancelled)',
+      );
+    });
+
+    it('falls back to the mixed wording when errors are in the run too', () => {
+      expect(formatDeleteSummary({ ...baseDeleteResult, alreadyGone: 2, failed: 1 })).toBe(
+        "Couldn't delete any messages. 2 messages were already gone on Discord. 1 message had an error.",
+      );
+    });
+  });
+});
+
+describe('deleteSummaryLevel (#271)', () => {
+  it('warns on errors and on runs that deleted nothing because everything was gone', () => {
+    expect(deleteSummaryLevel({ ...baseDeleteResult, deleted: 3 })).toBe('success');
+    expect(deleteSummaryLevel({ ...baseDeleteResult, deleted: 3, alreadyGone: 2 })).toBe('success');
+    expect(deleteSummaryLevel({ ...baseDeleteResult, deleted: 0, alreadyGone: 2 })).toBe('warning');
+    expect(deleteSummaryLevel({ ...baseDeleteResult, deleted: 3, failed: 1 })).toBe('warning');
+    expect(deleteSummaryLevel({ ...baseDeleteResult, deleted: 0, forbidden: 2 })).toBe('success');
+  });
+});
+
+describe('formatProvenanceTooltip (#271)', () => {
+  it('keeps the old sentence when nothing was already gone', () => {
+    expect(formatProvenanceTooltip(1200, 300, 0)).toBe('1,200 in package, 300 deleted via Discrub');
+  });
+
+  it('splits deleted via Discrub from already gone', () => {
+    expect(formatProvenanceTooltip(1200, 300, 120)).toBe('1,200 in package, 180 deleted via Discrub, 120 already gone');
   });
 });

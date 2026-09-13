@@ -7143,4 +7143,75 @@ describe('messageSlice', () => {
       });
     });
   });
+
+
+  describe('feeds the package deleted cache (#271)', () => {
+    const buildStore = async (channelIds: string[]) => {
+      const { configureStore } = await import('@reduxjs/toolkit');
+      const appReducer = (await import('@features/app/appSlice')).default;
+      const { defaultSettings } = await import('@features/app/appSlice');
+      const packageReducer = (await import('@features/package/packageSlice')).default;
+      const { initialPackageState } = await import('@features/package/packageSlice');
+      const { storage } = await import('@/extension/storage');
+      await storage.package.clear();
+      return configureStore({
+        reducer: { message: messageReducer, app: appReducer, package: packageReducer },
+        preloadedState: {
+          app: {
+            discrubPaused: false,
+            discrubCancelled: false,
+            isMinimized: false,
+            focusedView: false,
+            kofiOverlayOpen: false,
+            sidebarView: 'server' as const,
+            task: { status: 'idle' as const, message: '' },
+            settings: { ...defaultSettings, deleteDelay2: '0' },
+            previewThemeId: null,
+          } as never,
+          package: {
+            ...initialPackageState,
+            parsed: {
+              user: { id: 'pkg-user', username: 'tester', globalName: null, avatarHash: null },
+              guilds: [],
+              channels: channelIds.map((id) => ({ id, type: 0, name: id, guildId: 'g', guildName: 'g', messageCount: 3, isOrphan: false })),
+              totalMessages: 3,
+              packageSizeBytes: 1,
+            } as never,
+          },
+          message: initialMessageState,
+        },
+      });
+    };
+
+    it('deleteMessages records confirmed deletions for a held channel', async () => {
+      const { storage } = await import('@/extension/storage');
+      const mockDiscordService = {
+        deleteMessage: vi.fn().mockImplementation(async (_t: string, id: string) => ({ success: id !== 'm2' })),
+      };
+      vi.mocked(discordService.getDiscordService).mockReturnValue(mockDiscordService as any);
+      const appStore = await buildStore(['ch-1']);
+
+      await appStore.dispatch(
+        deleteMessages({
+          messages: [createMockMessage({ id: 'm1' }), createMockMessage({ id: 'm2' }), createMockMessage({ id: 'm3' })],
+          channelId: 'ch-1',
+          token: 'token',
+        }),
+      );
+
+      expect(appStore.getState().package.deletedMessageIds['ch-1']).toEqual(['m1', 'm3']);
+      expect(await storage.package.get('deleted:pkg-user')).toEqual({ 'ch-1': ['m1', 'm3'] });
+    });
+
+    it('deleteMessage records a single deletion for a held channel and ignores others', async () => {
+      const mockDiscordService = { deleteMessage: vi.fn().mockResolvedValue({ success: true }) };
+      vi.mocked(discordService.getDiscordService).mockReturnValue(mockDiscordService as any);
+      const appStore = await buildStore(['ch-1']);
+
+      await appStore.dispatch(deleteMessage({ messageId: 'm9', channelId: 'ch-1', token: 'token' }));
+      await appStore.dispatch(deleteMessage({ messageId: 'm10', channelId: 'elsewhere', token: 'token' }));
+
+      expect(appStore.getState().package.deletedMessageIds).toEqual({ 'ch-1': ['m9'] });
+    });
+  });
 });

@@ -18,6 +18,8 @@ import userReducer from '@features/user/userSlice';
 import appReducer from '@features/app/appSlice';
 import statusReducer from '@features/status/statusSlice';
 import channelReducer from '@features/channel/channelSlice';
+import packageReducer, { initialPackageState } from '@features/package/packageSlice';
+import { storage } from '@/extension/storage';
 import cacheReducer from '@features/cache/cacheSlice';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -259,6 +261,7 @@ function createStore(overrides?: {
       app: appReducer,
       status: statusReducer,
       channel: channelReducer,
+      package: packageReducer,
     },
     {
       auth: {

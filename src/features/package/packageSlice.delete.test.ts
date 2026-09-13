@@ -13,6 +13,9 @@ import packageReducer, {
   selectAllChannelMessages,
   selectChannelDeletedMessageCount,
   selectPackageDeletedMessageCount,
+  selectChannelGoneMessageCount,
+  selectPackageGoneMessageCount,
+  ALREADY_GONE_DELAY_MS,
   clearChannelMessageSelection,
   toggleMessageSelection,
   __testHelpers__,
@@ -23,6 +26,9 @@ import appReducer from '@features/app/appSlice';
 import statusReducer from '@features/status/statusSlice';
 import { buildFixturePackage } from '@/test/package-fixtures';
 import { storage } from '@/extension/storage';
+import { calculateRandomDelay } from '@utils/delayUtils';
+import { cancellableDelay } from '@utils/operationLoopUtils';
+import { externalDeletionsRecorded } from './packageDeletedCache';
 import type { RootState } from '@/app/store';
 
 const mockDeleteMessage = vi.fn();
@@ -183,6 +189,97 @@ describe('packageSlice — deletePackageMessages', () => {
     expect(result?.deleted).toBe(2);
     expect(result?.alreadyGone).toBe(1);
     expect(result?.failed).toBe(0);
+
+    // #271: the union keeps every gone id, the subset only the 404.
+    const pkg = store.getState().package;
+    expect(pkg.deletedMessageIds['200']).toEqual(['1', '3', '2']);
+    expect(pkg.goneMessageIds['200']).toEqual(['2']);
+    expect(await storage.package.get(`deleted:${FIXTURE_USER_ID}`)).toEqual({ '200': ['1', '3', '2'] });
+    expect(await storage.package.get(`gone:${FIXTURE_USER_ID}`)).toEqual({ '200': ['2'] });
+  });
+
+  it('keeps real deletions out of the gone subset and its persisted key (#271)', async () => {
+    mockDeleteMessage.mockResolvedValue({ success: true, status: 204 });
+    const store = await primedStore();
+    await store.dispatch(deletePackageMessages({ channelId: '200' }));
+
+    expect(store.getState().package.goneMessageIds['200']).toBeUndefined();
+    expect(await storage.package.get(`deleted:${FIXTURE_USER_ID}`)).toEqual({ '200': ['1', '2', '3'] });
+    expect(await storage.package.get(`gone:${FIXTURE_USER_ID}`)).toBeFalsy();
+  });
+
+  it('a run where everything was already gone warns and says nothing was deleted (#271)', async () => {
+    mockDeleteMessage.mockResolvedValue({ success: false, status: 404 });
+    const store = await primedStore();
+    await store.dispatch(deletePackageMessages({ channelId: '200' }));
+
+    const entries = store.getState().status.entries;
+    const summary = entries.find((e) => e.message.startsWith('Nothing to delete.'));
+    expect(summary?.level).toBe('warning');
+    expect(summary?.message).toBe('Nothing to delete. All 3 messages were already gone on Discord.');
+    // More than half were gone, so the rehydrate hint follows.
+    expect(entries.some((e) => e.level === 'warning' && e.message.includes('Rehydrate this channel first'))).toBe(true);
+  });
+
+  it('a mixed run keeps the success level and the existing sentence (#271)', async () => {
+    mockDeleteMessage.mockImplementation(async (_t, id) => {
+      if (id === '2') return { success: false, status: 404 };
+      return { success: true, status: 204 };
+    });
+    const store = await primedStore();
+    await store.dispatch(deletePackageMessages({ channelId: '200' }));
+
+    const entries = store.getState().status.entries;
+    const summary = entries.find((e) => e.message.startsWith('Deleted 2 messages.'));
+    expect(summary?.level).toBe('success');
+    expect(summary?.message).toBe('Deleted 2 messages. 1 message was already gone on Discord.');
+    expect(entries.some((e) => e.message.includes('Rehydrate this channel first'))).toBe(false);
+  });
+
+  it('waits only a short floor after a 404 instead of the full Delete Delay (#271)', async () => {
+    vi.mocked(calculateRandomDelay).mockReturnValue({ delayMs: 2000, delaySec: 2 } as never);
+    mockDeleteMessage.mockImplementation(async (_t, id) => {
+      if (id === '1') return { success: false, status: 404 };
+      return { success: true, status: 204 };
+    });
+    const store = await primedStore();
+    vi.mocked(cancellableDelay).mockClear();
+    await store.dispatch(deletePackageMessages({ channelId: '200' }));
+    vi.mocked(calculateRandomDelay).mockReturnValue({ delayMs: 0, delaySec: 0 } as never);
+
+    // Three messages, two waits: after the 404 (short) and after the
+    // real delete (full). No wait after the last one.
+    const waits = vi.mocked(cancellableDelay).mock.calls.map((c) => c[0]);
+    expect(waits).toEqual([ALREADY_GONE_DELAY_MS, 2000]);
+  });
+
+  it('logs a progress line every 50 already-gone answers (#271)', async () => {
+    mockDeleteMessage.mockResolvedValue({ success: false, status: 404 });
+    const store = makeStore();
+    await store.dispatch(importPackage(await buildFixturePackage()));
+    await store.dispatch(loadPackageChannelMessages('200'));
+    const ids = Array.from({ length: 120 }, (_, i) => `stale-${i}`);
+    store.dispatch(selectAllChannelMessages({ channelId: '200', messageIds: ids }));
+
+    await store.dispatch(deletePackageMessages({ channelId: '200' }));
+
+    const lines = store.getState().status.entries.filter((e) => e.message.includes('were already gone on Discord.') && e.level === 'info');
+    expect(lines.map((l) => l.message)).toEqual([
+      '50 of the 50 messages tried so far were already gone on Discord.',
+      '100 of the 100 messages tried so far were already gone on Discord.',
+    ]);
+    expect(store.getState().package.goneMessageIds['200']).toHaveLength(120);
+  });
+
+  it('skips ids the live purge already reported as gone (#271)', async () => {
+    mockDeleteMessage.mockResolvedValue({ success: true, status: 204 });
+    const store = await primedStore();
+    store.dispatch(externalDeletionsRecorded({ channelId: '200', ids: ['2'] }));
+
+    await store.dispatch(deletePackageMessages({ channelId: '200' }));
+
+    expect(mockDeleteMessage).toHaveBeenCalledTimes(2);
+    expect(mockDeleteMessage).not.toHaveBeenCalledWith('tok', '2', '200');
   });
 
   it('categorizes 403 as forbidden', async () => {
@@ -261,7 +358,7 @@ describe('packageSlice — deletePackageMessages', () => {
     const store = await primedStore();
     store.dispatch({
       type: hydratePackageDeletedCache.fulfilled.type,
-      payload: { '200': ['2'] },
+      payload: { deleted: { '200': ['2'] }, gone: {} },
       meta: { requestStatus: 'fulfilled' },
     });
 
@@ -427,5 +524,69 @@ describe('packageSlice — #236 deleted-cache hydrate ordering', () => {
 
     expect(store.getState().package.parsed).not.toBeNull();
     expect(store.getState().package.deletedMessageIds['200']).toEqual(['1']);
+  });
+});
+
+
+describe('packageSlice — #271 external deletions and gone provenance', () => {
+  beforeEach(async () => {
+    __testHelpers__.storeSourceFile(null);
+    await storage.package.clear();
+  });
+
+  it('externalDeletionsRecorded adds to the union and drops the ids from the selection', async () => {
+    const store = makeStore();
+    await store.dispatch(importPackage(await buildFixturePackage()));
+    store.dispatch(selectAllChannelMessages({ channelId: '200', messageIds: ['1', '2', '3'] }));
+
+    store.dispatch(externalDeletionsRecorded({ channelId: '200', ids: ['2'] }));
+
+    const pkg = store.getState().package;
+    expect(pkg.deletedMessageIds['200']).toEqual(['2']);
+    expect(pkg.goneMessageIds['200']).toBeUndefined();
+    expect(pkg.selectedMessageIds['200']).toEqual(['1', '3']);
+  });
+
+  it('externalDeletionsRecorded ignores channels outside the loaded package', async () => {
+    const store = makeStore();
+    await store.dispatch(importPackage(await buildFixturePackage()));
+    store.dispatch(externalDeletionsRecorded({ channelId: 'not-here', ids: ['2'] }));
+    expect(store.getState().package.deletedMessageIds['not-here']).toBeUndefined();
+  });
+
+  it('gone selectors count only the already-gone subset, scoped to the package', () => {
+    const state = stateWith({
+      parsed: minimalParsed,
+      deletedMessageIds: { '200': ['1', '2', '3'], stale: ['9'] },
+      goneMessageIds: { '200': ['2', '3'], stale: ['9'] },
+    });
+    expect(selectChannelGoneMessageCount('200')(state)).toBe(2);
+    expect(selectChannelGoneMessageCount('999')(state)).toBe(0);
+    expect(selectPackageGoneMessageCount(state)).toBe(2);
+    expect(selectPackageDeletedMessageCount(state)).toBe(3);
+  });
+
+  it('import hydrates the gone subset and prunes it against the archive', async () => {
+    await storage.package.set(`deleted:${FIXTURE_USER_ID}`, { '200': ['1', '2', 'purged-earlier'] });
+    await storage.package.set(`gone:${FIXTURE_USER_ID}`, { '200': ['2', 'purged-earlier'], 'other': ['x'] });
+    const store = makeStore();
+    await store.dispatch(importPackage(await buildFixturePackage()));
+
+    const pkg = store.getState().package;
+    expect(pkg.deletedMessageIds['200']).toEqual(['1', '2']);
+    expect(pkg.goneMessageIds['200']).toEqual(['2']);
+    expect(pkg.goneMessageIds['other']).toBeUndefined();
+    expect(await storage.package.get(`gone:${FIXTURE_USER_ID}`)).toEqual({ '200': ['2'] });
+  });
+
+  it('resume carries the gone subset', async () => {
+    const seed = makeStore();
+    await seed.dispatch(importPackage(await buildFixturePackage()));
+    await storage.package.set(`deleted:${FIXTURE_USER_ID}`, { '200': ['1', '2'] });
+    await storage.package.set(`gone:${FIXTURE_USER_ID}`, { '200': ['2'] });
+
+    const store = makeStore();
+    await store.dispatch(resumeStoredPackage());
+    expect(store.getState().package.goneMessageIds['200']).toEqual(['2']);
   });
 });

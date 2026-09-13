@@ -65,6 +65,7 @@ function statePackageLoaded(
       exportStatus: 'idle',
       exportError: null,
       deletedMessageIds,
+      goneMessageIds: {},
       enrichmentStatus: {},
       enrichmentProgress: {},
       enrichedMessages: {},

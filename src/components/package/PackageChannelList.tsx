@@ -23,14 +23,17 @@ import {
   Tag as TextChannelIcon,
   VisibilityOff as HideIcon,
   Visibility as ShowIcon,
+  HelpOutline as UnknownChannelIcon,
 } from '@mui/icons-material';
 import { useAppDispatch, useAppSelector } from '@/app/hooks';
 import {
   selectChannelDeletedMessageCount,
+  selectChannelGoneMessageCount,
   selectPackageChannel,
   selectParsedPackage,
   selectSelectedPackageChannelId,
 } from '@features/package/packageSlice';
+import { formatProvenanceTooltip } from '@features/package/packageStatusCopy';
 import type { PackageChannel } from '@features/package/packageTypes';
 import {
   getPackageChannelCategory,
@@ -253,6 +256,7 @@ const ChannelRow = ({ channel, selected, onSelect }: ChannelRowProps) => {
   const deletedCount = useAppSelector(
     selectChannelDeletedMessageCount(channel.id),
   );
+  const goneCount = useAppSelector(selectChannelGoneMessageCount(channel.id));
   const remainingCount = Math.max(channel.messageCount - deletedCount, 0);
   const countLabel =
     channel.messageCount === 0
@@ -292,7 +296,7 @@ const ChannelRow = ({ channel, selected, onSelect }: ChannelRowProps) => {
           </Typography>
           {deletedCount > 0 ? (
             <Tooltip
-              title={t('package.inPackageDeleted', { total: channel.messageCount.toLocaleString(), deleted: deletedCount.toLocaleString() })}
+              title={formatProvenanceTooltip(channel.messageCount, deletedCount, goneCount)}
             >
               <Typography
                 variant="caption"

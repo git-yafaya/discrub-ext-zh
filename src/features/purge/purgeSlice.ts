@@ -27,6 +27,7 @@ import { dropInvalidDate } from '@utils/dateValidation';
 import { isMessageChannel } from '@utils/channelTypeUtils';
 import { canAccessChannel } from '@/utils/permissionUtils';
 import { t } from '@/i18n';
+import { notePackageDeletions } from '@features/package/packageDeletedCache';
 
 /** Progress throttle — dispatch progress every N messages in messages mode */
 const PROGRESS_THROTTLE_MESSAGES = 10;
@@ -750,6 +751,25 @@ async function purgeChannelMessages(
     finalPass: totalFinalPass,
   });
 
+  // #271: deletions in a channel the loaded package also holds are fed to
+  // the package deleted cache, batched so a long run does not write IDB
+  // per message. Flushed at channel end (the finally below) as well.
+  const packageChannelIds = new Set(getState().package?.parsed?.channels.map((c) => c.id) ?? []);
+  const liveDeletions = new Map<string, string[]>();
+  const flushLiveDeletions = () => {
+    for (const [liveChannelId, ids] of liveDeletions) {
+      void notePackageDeletions(getState, dispatch, liveChannelId, ids);
+    }
+    liveDeletions.clear();
+  };
+  const noteLiveDeletion = (liveChannelId: string, id: string) => {
+    if (!packageChannelIds.has(liveChannelId)) return;
+    const ids = liveDeletions.get(liveChannelId) ?? [];
+    ids.push(id);
+    liveDeletions.set(liveChannelId, ids);
+    if (ids.length >= LIVE_DELETION_BATCH) flushLiveDeletions();
+  };
+
   // Threads we un-archived during this run. The finally block re-archives
   // them so we never leave the user's thread state unintentionally changed.
   const unarchivedThisRun = new Set<string>();
@@ -1345,6 +1365,7 @@ async function purgeChannelMessages(
   };
 
   } finally {
+    flushLiveDeletions();
     // Re-archive any threads we un-archived during this run — restore
     // the user's original thread state. Runs on success, cancellation,
     // and errors. Best-effort: if the re-archive itself fails we log a

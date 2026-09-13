@@ -140,7 +140,14 @@ describe('Data package import', () => {
       cy.get('[role="dialog"]').contains('button', 'Delete').click();
 
       cy.wait('@delete404');
-      cy.contains(/already gone/i, { timeout: 10000 }).should('be.visible');
+      // #271: nothing was removed, so the result is a warning, and the
+      // caption says the row is gone rather than "previously deleted".
+      cy.contains(/Nothing to delete\. 1 message was already gone on Discord\./, { timeout: 10000 })
+        .should('be.visible')
+        .closest('[role="alert"]')
+        .should('have.class', 'MuiAlert-colorWarning');
+      cy.contains(/1 gone from Discord/).should('be.visible');
+      cy.contains(/previously deleted/).should('not.exist');
     });
 
     it('disables Delete on orphan channels', () => {

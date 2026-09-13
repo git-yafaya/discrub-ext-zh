@@ -36,9 +36,18 @@ import {
   selectSearchDelay,
   setDiscrubCancelled,
 } from '@features/app/appSlice';
-import { storage } from '@/extension/storage';
+import {
+  readDeletedCache,
+  readGoneCache,
+  writeDeletedCache,
+  writeGoneCache,
+  recordDeletions,
+  externalDeletionsRecorded,
+  type DeletedCacheMap,
+} from './packageDeletedCache';
 import {
   formatDeleteSummary,
+  deleteSummaryLevel,
   formatRehydrateLogSummary,
 } from '@features/package/packageStatusCopy';
 import { IsPinnedType, QueryStringParam } from 'discrub-core/discord-enum';
@@ -118,8 +127,10 @@ export interface DeleteResult {
   failed: number;
   /** User cancelled mid-run. */
   cancelled: boolean;
-  /** IDs that should be treated as gone (successful deletes + 404s). */
-  confirmedGoneIds: string[];
+  /** IDs Discord accepted a DELETE for during this run. */
+  deletedIds: string[];
+  /** IDs Discord answered 404 for: already gone before this run (#271). */
+  alreadyGoneIds: string[];
 }
 
 export interface PackageState {
@@ -151,6 +162,18 @@ export interface PackageState {
    * the user already cleaned up.
    */
   deletedMessageIds: Record<string, string[]>;
+  /**
+   * #271: the subset of `deletedMessageIds` that a DELETE answered 404
+   * for, i.e. the message was already gone before Discrub tried it.
+   * Provenance shown to the user ("deleted via Discrub") is the union
+   * minus this map. Persisted under `gone:{userId}`.
+   */
+  goneMessageIds: Record<string, string[]>;
+  /**
+   * #269: compressed bytes read so far while an import runs, for the
+   * determinate bar in ImportDialog. Null when no import is running.
+   */
+  importProgress: { read: number; total: number } | null;
   /**
    * Tier 2 rehydration state — per-channel enrichment results fetched
    * from Discord's API. A channel with no entry here is Tier 1 (source
@@ -201,6 +224,8 @@ export const initialPackageState: PackageState = {
   exportStatus: 'idle',
   exportError: null,
   deletedMessageIds: {},
+  goneMessageIds: {},
+  importProgress: null,
   enrichmentStatus: {},
   enrichmentProgress: {},
   enrichedMessages: {},
@@ -211,35 +236,6 @@ export const initialPackageState: PackageState = {
   activeEnrichmentChannelId: null,
   filterCriteria: {},
 };
-
-/** Per-user IDB key for the deleted-message cache (lives in Discrub-package). */
-function deletedCacheKey(userId: string): string {
-  return `deleted:${userId}`;
-}
-
-/**
- * Reads the persisted deleted-message map for the given user.
- * Returns an empty map on any read/parse error.
- */
-async function readDeletedCache(
-  userId: string,
-): Promise<Record<string, string[]>> {
-  const value = await storage.package.get<Record<string, string[]>>(
-    deletedCacheKey(userId),
-  );
-  return value && typeof value === 'object' ? value : {};
-}
-
-async function writeDeletedCache(
-  userId: string,
-  map: Record<string, string[]>,
-): Promise<void> {
-  try {
-    await storage.package.set(deletedCacheKey(userId), map);
-  } catch {
-    /* storage is best-effort */
-  }
-}
 
 /**
  * F19 (#236): the deleted cache is keyed per user with no package
@@ -256,23 +252,24 @@ async function writeDeletedCache(
  */
 async function pruneDeletedCacheAgainstArchive(
   parsed: ParsedPackage,
-  cache: Record<string, string[]>,
-): Promise<Record<string, string[]>> {
-  const cachedChannelIds = Object.keys(cache);
-  if (cachedChannelIds.length === 0) return cache;
+  cache: DeletedCacheMap,
+  gone: DeletedCacheMap = {},
+): Promise<{ deleted: DeletedCacheMap; gone: DeletedCacheMap }> {
+  const cachedChannelIds = Array.from(new Set([...Object.keys(cache), ...Object.keys(gone)]));
+  if (cachedChannelIds.length === 0) return { deleted: cache, gone };
 
   const archiveChannelIds = new Set(parsed.channels.map((c) => c.id));
-  const pruned: Record<string, string[]> = {};
+  const pruned: DeletedCacheMap = {};
+  const prunedGone: DeletedCacheMap = {};
   let changed = false;
+  let goneChanged = false;
 
   for (const channelId of cachedChannelIds) {
-    const ids = cache[channelId];
-    if (!ids?.length) {
-      changed = true;
-      continue;
-    }
-    if (!archiveChannelIds.has(channelId)) {
-      changed = true;
+    const ids = cache[channelId] ?? [];
+    const goneIds = gone[channelId] ?? [];
+    if (!archiveChannelIds.has(channelId) || (ids.length === 0 && goneIds.length === 0)) {
+      if (ids.length > 0 || channelId in cache) changed = true;
+      if (goneIds.length > 0 || channelId in gone) goneChanged = true;
       continue;
     }
     try {
@@ -281,15 +278,22 @@ async function pruneDeletedCacheAgainstArchive(
       const kept = ids.filter((id) => present.has(id));
       if (kept.length > 0) pruned[channelId] = kept;
       if (kept.length !== ids.length) changed = true;
+      // #271: the gone subset can only hold ids the union holds.
+      const keptSet = new Set(kept);
+      const keptGone = goneIds.filter((id) => keptSet.has(id));
+      if (keptGone.length > 0) prunedGone[channelId] = keptGone;
+      if (keptGone.length !== goneIds.length) goneChanged = true;
     } catch {
       // Unreadable channel: keep the cached ids rather than guessing —
       // worst case is the pre-fix behavior, for this channel only.
-      pruned[channelId] = ids;
+      if (ids.length > 0) pruned[channelId] = ids;
+      if (goneIds.length > 0) prunedGone[channelId] = goneIds;
     }
   }
 
   if (changed) await writeDeletedCache(parsed.user.id, pruned);
-  return pruned;
+  if (goneChanged) await writeGoneCache(parsed.user.id, prunedGone);
+  return { deleted: pruned, gone: prunedGone };
 }
 
 /**
@@ -339,11 +343,12 @@ export const hydrateCachedEnrichment = createAsyncThunk<
  * remains a valid standalone recovery path.
  */
 export const hydratePackageDeletedCache = createAsyncThunk<
-  Record<string, string[]>,
+  { deleted: DeletedCacheMap; gone: DeletedCacheMap },
   { userId: string },
   { state: RootState }
 >('package/hydrateDeletedCache', async ({ userId }) => {
-  return readDeletedCache(userId);
+  const [deleted, gone] = await Promise.all([readDeletedCache(userId), readGoneCache(userId)]);
+  return { deleted, gone };
 });
 
 /**
@@ -380,7 +385,7 @@ export const clearPackageDeletedCache = createAsyncThunk<
 >('package/clearDeletedCache', async (_, { getState }) => {
   const userId = getState().package.parsed?.user.id;
   if (!userId) return;
-  await writeDeletedCache(userId, {});
+  await Promise.all([writeDeletedCache(userId, {}), writeGoneCache(userId, {})]);
 });
 
 /** Parse a Discord data package file and validate it against the current auth. */
@@ -388,17 +393,27 @@ export const importPackage = createAsyncThunk<
   {
     parsed: ParsedPackage;
     validation: PackageValidationResult;
-    deletedMessageIds: Record<string, string[]>;
+    deletedMessageIds: DeletedCacheMap;
+    goneMessageIds: DeletedCacheMap;
   },
   File | Blob | ArrayBuffer,
   { state: RootState; rejectValue: string }
->('package/import', async (input, { getState, rejectWithValue }) => {
+>('package/import', async (input, { getState, dispatch, rejectWithValue }) => {
   try {
-    // Stream once into IndexedDB (#162). After this returns, every
+    // Stream once into IndexedDB (#162, #269). After this returns, every
     // subsequent channel/avatar read is an O(1) IDB lookup; the
-    // original File handle is no longer needed. #203: `input` may already
-    // be the eagerly-read bytes (read while the File reference was fresh).
-    const parsed = await streamPackageToStorage(input);
+    // original File handle is no longer needed. The reader reports
+    // compressed bytes as it goes; only whole-percent changes reach
+    // the store.
+    let lastPct = -1;
+    const { parsed, diagnostics } = await importPackageToStorage(input, {
+      onBytes: (read, total) => {
+        const pct = total > 0 ? Math.floor((read / total) * 100) : 0;
+        if (pct === lastPct && read < total) return;
+        lastPct = pct;
+        dispatch(setImportProgress({ read, total }));
+      },
+    });
     const state = getState();
     const authedUserId = state.user?.currentUser?.id ?? null;
     const validation = validatePackage(parsed, authedUserId);
@@ -419,16 +434,62 @@ export const importPackage = createAsyncThunk<
     // hydration can never lose a race against the reducer's state reset.
     // F19: pruned against the just-streamed archive so a fresh package's
     // already-reduced counts aren't double-subtracted.
-    const deletedMessageIds = await pruneDeletedCacheAgainstArchive(
+    const [deletedCache, goneCache] = await Promise.all([
+      readDeletedCache(parsed.user.id),
+      readGoneCache(parsed.user.id),
+    ]);
+    const { deleted: deletedMessageIds, gone: goneMessageIds } = await pruneDeletedCacheAgainstArchive(
       parsed,
-      await readDeletedCache(parsed.user.id),
+      deletedCache,
+      goneCache,
     );
 
-    return { parsed, validation, deletedMessageIds };
+    // #269: one line about what the reader saw. A warning when folders
+    // were skipped or a channel parsed to nothing, so a package that
+    // "loaded fine" with missing pieces says so where the user looks.
+    const dropped =
+      diagnostics.droppedMissingChannelJson +
+      diagnostics.droppedMissingMessages +
+      diagnostics.droppedUnparsableChannelJson;
+    const troubled = dropped > 0 || diagnostics.channelsWithNoStoredRows > 0 || diagnostics.unrecognizedTypes > 0;
+    dispatch(addStatusEntry({
+      level: troubled ? 'warning' : 'info',
+      message: formatImportDiagnostics(parsed, diagnostics),
+    }));
+
+    return { parsed, validation, deletedMessageIds, goneMessageIds };
   } catch (err) {
     return rejectWithValue(err instanceof Error ? err.message : 'Failed to parse package');
   }
 });
+
+/** #269: the status-log line written once per import. */
+export function formatImportDiagnostics(parsed: ParsedPackage, d: ImportDiagnostics): string {
+  const parts: string[] = [
+    t('status.package.imported', {
+      channels: t('package.channels', { count: parsed.channels.length }),
+      messages: t('package.messages', { count: parsed.totalMessages }),
+    }),
+  ];
+  const dropped = d.droppedMissingChannelJson + d.droppedMissingMessages + d.droppedUnparsableChannelJson;
+  if (dropped > 0) {
+    const reasons: string[] = [];
+    if (d.droppedMissingChannelJson > 0) reasons.push(t('status.package.droppedNoChannelJson', { count: d.droppedMissingChannelJson }));
+    if (d.droppedMissingMessages > 0) reasons.push(t('status.package.droppedNoMessages', { count: d.droppedMissingMessages }));
+    if (d.droppedUnparsableChannelJson > 0) reasons.push(t('status.package.droppedUnreadable', { count: d.droppedUnparsableChannelJson }));
+    parts.push(t('status.package.droppedFolders', { count: dropped, reasons: reasons.join(', ') }));
+  }
+  if (d.channelsWithNoStoredRows > 0) {
+    parts.push(t('status.package.noStoredRows', {
+      count: d.channelsWithNoStoredRows,
+      keys: d.sampleRowKeys && d.sampleRowKeys.length > 0 ? d.sampleRowKeys.join(', ') : t('status.package.unknown'),
+    }));
+  }
+  if (d.unrecognizedTypes > 0) {
+    parts.push(t('status.package.unrecognizedTypes', { count: d.unrecognizedTypes }));
+  }
+  return parts.join(' ');
+}
 
 /**
  * Resume a previously-streamed package from IndexedDB without touching
@@ -440,7 +501,8 @@ export const resumeStoredPackage = createAsyncThunk<
   {
     parsed: ParsedPackage;
     validation: PackageValidationResult;
-    deletedMessageIds: Record<string, string[]>;
+    deletedMessageIds: DeletedCacheMap;
+    goneMessageIds: DeletedCacheMap;
   } | null,
   void,
   { state: RootState; rejectValue: string }
@@ -456,8 +518,11 @@ export const resumeStoredPackage = createAsyncThunk<
     // #236: read the deleted cache here (not via a fire-and-forget
     // hydrate dispatch) so the fulfilled reducer sets deleted ids in
     // the same action that hydrates `parsed` — no ordering hazard.
-    const deletedMessageIds = await readDeletedCache(parsed.user.id);
-    return { parsed, validation, deletedMessageIds };
+    const [deletedMessageIds, goneMessageIds] = await Promise.all([
+      readDeletedCache(parsed.user.id),
+      readGoneCache(parsed.user.id),
+    ]);
+    return { parsed, validation, deletedMessageIds, goneMessageIds };
   } catch (err) {
     return rejectWithValue(err instanceof Error ? err.message : 'Failed to resume package');
   }
@@ -581,7 +646,21 @@ export const deletePackageMessages = createAsyncThunk<
     forbidden: 0,
     failed: 0,
     cancelled: false,
-    confirmedGoneIds: [],
+    deletedIds: [],
+    alreadyGoneIds: [],
+  };
+
+  // #271: a run that started with a stale selection (messages removed
+  // by the live purge after the package was exported) answers 404 for
+  // every one. Say so as it goes, not only at the end.
+  const noteAlreadyGone = (tried: number) => {
+    result.alreadyGone += 1;
+    if (result.alreadyGone % ALREADY_GONE_LOG_EVERY === 0) {
+      dispatch(addStatusEntry({
+        level: 'info',
+        message: t('status.package.alreadyGoneProgress', { gone: result.alreadyGone, tried }),
+      }));
+    }
   };
 
   dispatch(addStatusEntry({
@@ -597,6 +676,7 @@ export const deletePackageMessages = createAsyncThunk<
       dispatch(setDeleteProgress({ current: i, total: ids.length }));
 
       const messageId = ids[i];
+      let wasAlreadyGone = false;
       try {
         // discrub-core's `discordService.deleteMessage` does NOT throw
         // on HTTP errors; its `withRetry` wrapper catches and returns a
@@ -606,10 +686,11 @@ export const deletePackageMessages = createAsyncThunk<
         const apiResult = await discordService.deleteMessage(token, messageId, channelId);
         if (apiResult.success) {
           result.deleted += 1;
-          result.confirmedGoneIds.push(messageId);
+          result.deletedIds.push(messageId);
         } else if (apiResult.status === 404) {
-          result.alreadyGone += 1;
-          result.confirmedGoneIds.push(messageId);
+          noteAlreadyGone(i + 1);
+          result.alreadyGoneIds.push(messageId);
+          wasAlreadyGone = true;
         } else if (apiResult.status === 403) {
           result.forbidden += 1;
         } else {
@@ -623,8 +704,9 @@ export const deletePackageMessages = createAsyncThunk<
         if (err instanceof CancelledError) throw err;
         const status = extractHttpStatus(err);
         if (status === 404) {
-          result.alreadyGone += 1;
-          result.confirmedGoneIds.push(messageId);
+          noteAlreadyGone(i + 1);
+          result.alreadyGoneIds.push(messageId);
+          wasAlreadyGone = true;
         } else if (status === 403) {
           result.forbidden += 1;
         } else {
@@ -636,10 +718,14 @@ export const deletePackageMessages = createAsyncThunk<
         }
       }
 
-      // Delay between deletes — unless we're on the last one.
+      // Delay between deletes — unless we're on the last one. A 404 did
+      // not delete anything, so it only pays a short floor (#271) instead
+      // of the full Delete Delay; a stale selection of thousands would
+      // otherwise wait hours for nothing.
       if (i < ids.length - 1) {
         const calc = calculateRandomDelay(deleteDelay, delayModifier);
-        const wasCancelled = await cancellableDelay(calc.delayMs, getState);
+        const delayMs = wasAlreadyGone ? Math.min(calc.delayMs, ALREADY_GONE_DELAY_MS) : calc.delayMs;
+        const wasCancelled = await cancellableDelay(delayMs, getState);
         if (wasCancelled) throw new CancelledError();
       }
     }
@@ -656,23 +742,33 @@ export const deletePackageMessages = createAsyncThunk<
 
   dispatch(setDeleteProgress({ current: ids.length, total: ids.length }));
   dispatch(addStatusEntry({
-    level: result.failed > 0 ? 'warning' : 'success',
+    level: deleteSummaryLevel(result),
     message: formatDeleteSummary(result),
   }));
+  if (result.alreadyGone > 0 && result.alreadyGone * 2 > ids.length) {
+    dispatch(addStatusEntry({
+      level: 'warning',
+      message: t('status.package.mostlyGoneHint'),
+    }));
+  }
 
-  // Persist the updated deleted-message cache so the history survives
-  // reloads. We read the post-reducer state by reading the current map
-  // plus this run's confirmedGoneIds merged in.
+  // Persist the updated caches so the history survives reloads. Both
+  // writes go through the serialised cache module, which re-reads the
+  // persisted blob first, so a live purge feeding the cache at the same
+  // time cannot be clobbered by the state captured at thunk start.
   const userId = state.package.parsed?.user.id;
-  if (userId && result.confirmedGoneIds.length > 0) {
-    const existingMap = state.package.deletedMessageIds;
-    const existing = existingMap[channelId] ?? [];
-    const merged = Array.from(new Set([...existing, ...result.confirmedGoneIds]));
-    await writeDeletedCache(userId, { ...existingMap, [channelId]: merged });
+  if (userId) {
+    await recordDeletions(userId, channelId, result.deletedIds, 'deleted');
+    await recordDeletions(userId, channelId, result.alreadyGoneIds, 'gone');
   }
 
   return result;
 });
+
+/** #271: log a progress line after this many already-gone answers. */
+export const ALREADY_GONE_LOG_EVERY = 50;
+/** #271: the wait after a 404 instead of the full Delete Delay. */
+export const ALREADY_GONE_DELAY_MS = 250;
 
 /** Best-effort HTTP-status extraction for errors surfaced by discord-service/fetch. */
 function extractHttpStatus(err: unknown): number | null {
@@ -1879,6 +1975,8 @@ const packageSlice = createSlice({
         // here (instead of resetting and racing a separate hydrate
         // thunk) guarantees purged-through-Discrub ids survive import.
         state.deletedMessageIds = action.payload.deletedMessageIds;
+        state.goneMessageIds = action.payload.goneMessageIds;
+        state.importProgress = null;
         // #172: previous package's filters don't carry over to a new import.
         state.filterCriteria = {};
       })
@@ -1900,6 +1998,7 @@ const packageSlice = createSlice({
         // #236: same atomic treatment as importPackage.fulfilled —
         // deleted ids come from the payload, never a racing hydrate.
         state.deletedMessageIds = action.payload.deletedMessageIds;
+        state.goneMessageIds = action.payload.goneMessageIds;
         state.filterCriteria = {};
       })
       .addCase(loadPackageChannelMessages.pending, (state, action) => {
@@ -1950,12 +2049,17 @@ const packageSlice = createSlice({
         state.deleteProgress = null;
 
         const channelId = action.meta.arg.channelId;
-        const goneIds = action.payload.confirmedGoneIds;
+        const { deletedIds, alreadyGoneIds } = action.payload;
 
-        // Merge into the persistent deleted set for this channel.
+        // Merge into the persistent deleted set for this channel: the
+        // union keeps its "not on Discord any more" meaning, the gone
+        // subset records which of those Discrub never actually removed.
         const existing = state.deletedMessageIds[channelId] ?? [];
-        const merged = Array.from(new Set([...existing, ...goneIds]));
-        state.deletedMessageIds[channelId] = merged;
+        state.deletedMessageIds[channelId] = Array.from(new Set([...existing, ...deletedIds, ...alreadyGoneIds]));
+        if (alreadyGoneIds.length > 0) {
+          const existingGone = state.goneMessageIds[channelId] ?? [];
+          state.goneMessageIds[channelId] = Array.from(new Set([...existingGone, ...alreadyGoneIds]));
+        }
 
         // Clear selection (they're gone or intended to be).
         delete state.selectedMessageIds[channelId];
@@ -1982,10 +2086,27 @@ const packageSlice = createSlice({
         state.exportError = action.payload ?? 'Export failed';
       })
       .addCase(hydratePackageDeletedCache.fulfilled, (state, action) => {
-        state.deletedMessageIds = action.payload;
+        state.deletedMessageIds = action.payload.deleted;
+        state.goneMessageIds = action.payload.gone;
       })
       .addCase(clearPackageDeletedCache.fulfilled, (state) => {
         state.deletedMessageIds = {};
+        state.goneMessageIds = {};
+      })
+      // #271: the live purge or the message table deleted messages that
+      // belong to a channel in this package.
+      .addCase(externalDeletionsRecorded, (state, action) => {
+        const { channelId, ids } = action.payload;
+        if (!state.parsed?.channels.some((c) => c.id === channelId)) return;
+        const existing = state.deletedMessageIds[channelId] ?? [];
+        state.deletedMessageIds[channelId] = Array.from(new Set([...existing, ...ids]));
+        const selected = state.selectedMessageIds[channelId];
+        if (selected) {
+          const gone = new Set(ids);
+          const remaining = selected.filter((id) => !gone.has(id));
+          if (remaining.length > 0) state.selectedMessageIds[channelId] = remaining;
+          else delete state.selectedMessageIds[channelId];
+        }
       })
       .addCase(enrichPackageChannel.pending, (state, action) => {
         const { channelId } = action.meta.arg;
@@ -2094,11 +2215,28 @@ export const selectTotalDeletedMessageCount = (state: RootState): number =>
     (sum, arr) => sum + arr.length,
     0,
   );
-/** Count of ids deleted via Discrub for one channel (0 when none). */
+/** Count of ids gone from Discord for one channel (0 when none). */
 export const selectChannelDeletedMessageCount =
   (channelId: string) =>
   (state: RootState): number =>
     state.package.deletedMessageIds[channelId]?.length ?? 0;
+/** #271: ids of one channel that were already gone when Discrub tried them. */
+export const selectChannelGoneMessageIds =
+  (channelId: string) =>
+  (state: RootState): string[] =>
+    state.package.goneMessageIds[channelId] ?? [];
+/** #271: how many of one channel's gone ids Discrub never actually removed. */
+export const selectChannelGoneMessageCount =
+  (channelId: string) =>
+  (state: RootState): number =>
+    state.package.goneMessageIds[channelId]?.length ?? 0;
+/** #271: already-gone total scoped to the parsed package's channels. */
+export const selectPackageGoneMessageCount = (state: RootState): number => {
+  const parsed = state.package.parsed;
+  if (!parsed) return 0;
+  const map = state.package.goneMessageIds;
+  return parsed.channels.reduce((sum, c) => sum + (map[c.id]?.length ?? 0), 0);
+};
 /**
  * Deleted-via-Discrub total scoped to the currently-parsed package's
  * channels (#236). The persisted cache is keyed per user and may carry

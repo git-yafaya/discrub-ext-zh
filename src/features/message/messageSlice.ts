@@ -23,6 +23,7 @@ import { selectAuthToken } from '@features/auth/authSlice';
 import { countActiveFilters } from 'discrub-core/filtering';
 import { t } from '@/i18n';
 import { fetchSearchPageWithRetry, describeSearchFailure } from './searchPageRetry';
+import { notePackageDeletions } from '@features/package/packageDeletedCache';
 
 /**
  * Status-log hooks for a single-page search request (#262): one warning
@@ -99,7 +100,7 @@ export const deleteMessage = createAsyncThunk(
       channelId: string;
       token: string;
     },
-    { rejectWithValue }
+    { rejectWithValue, getState, dispatch }
   ) => {
     try {
       const discordService = getDiscordService();
@@ -109,6 +110,8 @@ export const deleteMessage = createAsyncThunk(
         return rejectWithValue(withHttpStatus('Failed to delete message', response.status));
       }
 
+      // #271: a loaded package for this channel learns about the deletion.
+      await notePackageDeletions(getState as () => RootState, dispatch, channelId, [messageId]);
       return messageId;
     } catch (error) {
       return rejectWithValue(
@@ -221,6 +224,9 @@ export const deleteMessages = createAsyncThunk(
       } finally {
         flushPendingRemovals();
       }
+
+      // #271: a loaded package for this channel learns about the deletions.
+      await notePackageDeletions(getState as () => RootState, dispatch, channelId, deletedIds);
 
       if (deletedIds.length > 0) {
         dispatch(addStatusEntry({ level: 'success', message: t('status.msg.deleted', { count: deletedIds.length }) }));

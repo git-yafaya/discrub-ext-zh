@@ -17,6 +17,7 @@ const OUT_MISMATCH = path.resolve(
   __dirname,
   '../cypress/fixtures/test-package-mismatched.zip',
 );
+const OUT_MANY = path.resolve(__dirname, '../cypress/fixtures/test-package-many.zip');
 const OUT_INVALID = path.resolve(
   __dirname,
   '../cypress/fixtures/test-package-invalid.zip',
@@ -145,6 +146,8 @@ async function writeZip(zip, filepath) {
     }),
     OUT_MISMATCH,
   );
+  // #271: base package plus a 60-message channel for the package purge spec
+  await writeZip(buildManyPackage({ userId: '111222333444555666' }), OUT_MANY);
   // Invalid: no account/user.json
   {
     const zip = new JSZip();

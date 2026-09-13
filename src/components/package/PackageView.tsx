@@ -13,14 +13,17 @@ import {
   selectChannelDeletedMessageCount,
   selectPackageChannel,
   selectPackageDeletedMessageCount,
+  selectPackageGoneMessageCount,
+  selectChannelGoneMessageCount,
   selectPackageValidation,
   selectParsedPackage,
   selectSelectedPackageChannelId,
   selectTotalDeletedMessageCount,
 } from '@features/package/packageSlice';
+import { formatProvenanceTooltip } from '@features/package/packageStatusCopy';
 import { selectCurrentUser } from '@features/user/userSlice';
 import { selectGuilds } from '@features/guild/guildSlice';
-import { getPackageChannelLabel } from '@features/package/packageDisplayUtils';
+import { getPackageChannelLabel, getPackageChannelCategory } from '@features/package/packageDisplayUtils';
 import ImportDialog from './ImportDialog';
 import PackageAnalytics from './PackageAnalytics';
 import PackageMessageTable from './PackageMessageTable';
@@ -46,6 +49,11 @@ const PackageView = () => {
   const packageDeleted = useAppSelector(selectPackageDeletedMessageCount);
   const selectedChannelDeleted = useAppSelector(
     selectChannelDeletedMessageCount(selectedChannelId ?? ''),
+  );
+  // #271: how many of those were already gone when Discrub tried them.
+  const packageGone = useAppSelector(selectPackageGoneMessageCount);
+  const selectedChannelGone = useAppSelector(
+    selectChannelGoneMessageCount(selectedChannelId ?? ''),
   );
   const currentUserId = useAppSelector(selectCurrentUser)?.id ?? null;
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -134,7 +142,7 @@ const PackageView = () => {
             </Typography>
             {selectedChannelDeleted > 0 && !selectedChannel.isOrphan ? (
               <Tooltip
-                title={t('package.inPackageDeleted', { total: selectedChannel.messageCount.toLocaleString(), deleted: selectedChannelDeleted.toLocaleString() })}
+                title={formatProvenanceTooltip(selectedChannel.messageCount, selectedChannelDeleted, selectedChannelGone)}
               >
                 {captionNode}
               </Tooltip>
@@ -208,7 +216,7 @@ const PackageView = () => {
       <Stack direction="row" spacing={1} sx={{ mt: 2, flexWrap: 'wrap', gap: 1 }}>
         {packageDeleted > 0 ? (
           <Tooltip
-            title={t('package.inPackageDeleted', { total: totalMessages.toLocaleString(), deleted: packageDeleted.toLocaleString() })}
+            title={formatProvenanceTooltip(totalMessages, packageDeleted, packageGone)}
           >
             <Chip
               label={t('package.messages', { count: Math.max(totalMessages - packageDeleted, 0) })}

@@ -721,6 +721,7 @@ describe('ExportDialog', () => {
               exportStatus: 'idle',
               exportError: null,
               deletedMessageIds: {},
+              goneMessageIds: {},
               enrichmentStatus: enriched ? { '200': 'done' } : {},
               enrichmentProgress: {},
               enrichedMessages: enriched

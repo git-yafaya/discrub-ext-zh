@@ -64,6 +64,7 @@ function stateWith({
       exportStatus: 'idle',
       exportError: null,
       deletedMessageIds: {},
+      goneMessageIds: {},
       enrichmentStatus: {},
       enrichmentProgress: {},
       enrichedMessages: {},
@@ -891,5 +892,55 @@ describe('<PackageMessageTable />', () => {
     renderWithProviders(<PackageMessageTable channel={channel} />, { preloadedState: base });
     const mention = document.querySelector('.user-mention');
     expect(mention?.textContent).toBe('@Alice');
+  });
+
+  describe('#271 already-gone provenance', () => {
+    const twoRows = {
+      '200': [
+        { id: '1', timestamp: '2023-01-01 00:00:00.000000+00:00', content: 'kept', attachments: [] },
+        { id: '2', timestamp: '2023-01-01 00:01:00.000000+00:00', content: 'was already gone', attachments: [] },
+      ],
+    };
+
+    it('captions gone-only ids as "gone from Discord" rather than "previously deleted"', () => {
+      const base = stateWith({ loadedChannels: twoRows }) as any;
+      base.package.deletedMessageIds = { '200': ['2'] };
+      base.package.goneMessageIds = { '200': ['2'] };
+      renderWithProviders(<PackageMessageTable channel={channel} />, { preloadedState: base });
+
+      expect(screen.getByText(/1 gone from Discord/i)).toBeInTheDocument();
+      expect(screen.queryByText(/previously deleted/i)).not.toBeInTheDocument();
+    });
+
+    it('shows the all-gone delete result as a warning', () => {
+      const base = stateWith({ loadedChannels: twoRows }) as any;
+      base.package.deleteResult = { deleted: 0, alreadyGone: 2, forbidden: 0, failed: 0, cancelled: false, deletedIds: [], alreadyGoneIds: ['1', '2'] };
+      renderWithProviders(<PackageMessageTable channel={channel} />, { preloadedState: base });
+
+      const alert = screen.getByText(/Nothing to delete/i).closest('[role="alert"]');
+      expect(alert).toHaveClass('MuiAlert-colorWarning');
+    });
+
+    it('suggests rehydrating first on a large selection of a channel that was never rehydrated', () => {
+      const ids = Array.from({ length: 101 }, (_, i) => `id-${i}`);
+      const loadedChannels = {
+        '200': ids.map((id, i) => ({ id, timestamp: `2023-01-01 00:${String(i % 60).padStart(2, '0')}:00.000000+00:00`, content: `m${i}`, attachments: [] })),
+      };
+      renderWithProviders(<PackageMessageTable channel={channel} />, {
+        preloadedState: stateWith({ loadedChannels, selectedMessageIds: { '200': ids } }),
+      });
+      fireEvent.click(screen.getByRole('button', { name: /Delete selected/i }));
+
+      expect(screen.getByTestId('package-delete-rehydrate-hint')).toHaveTextContent(/Rehydrate first to skip them/);
+    });
+
+    it('does not show the rehydrate hint for a small selection', () => {
+      const base = stateWith({ loadedChannels: twoRows, selectedMessageIds: { '200': ['1', '2'] } });
+      renderWithProviders(<PackageMessageTable channel={channel} />, { preloadedState: base });
+      fireEvent.click(screen.getByRole('button', { name: /Delete selected/i }));
+
+      expect(screen.getByRole('dialog')).toBeInTheDocument();
+      expect(screen.queryByTestId('package-delete-rehydrate-hint')).not.toBeInTheDocument();
+    });
   });
 });
