@@ -51,6 +51,9 @@ const MessageTypeFilter = ({ selectedTypes, onChange }: MessageTypeFilterProps) 
       <Typography variant="subtitle2" gutterBottom sx={{ fontWeight: 600 }}>
         {t('filters.has')}
       </Typography>
+      <Typography variant="caption" color="text.secondary" component="p" sx={{ mb: 1 }} data-testid="has-filter-help">
+        {t('filters.hasHelp')}
+      </Typography>
       {selectedTypes.length > 0 && (
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mb: 1 }}>
           {selectedTypes.map((type) => {

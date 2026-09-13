@@ -7,7 +7,7 @@ import type { PurgeProgress, PurgeConfig, PurgeMode, BulkPurgeContext, ServerPur
 import type { RootState } from '@/app/store';
 import { selectCurrentUser } from '@features/user/userSlice';
 import { selectAuthToken } from '@features/auth/authSlice';
-import { selectSearchDelay, selectDeleteDelay, selectDelayModifier } from '@features/app/appSlice';
+import { selectSearchDelay, selectDeleteDelay, selectDelayModifier, setDiscrubPaused } from '@features/app/appSlice';
 import { getDiscordService } from '@services/discordService';
 import { addStatusEntry, showOperationTip, showToast } from '@features/status/statusSlice';
 import { selectSelectedChannel } from '@features/channel/channelSlice';
@@ -101,6 +101,39 @@ const formatPurgeDetail = (
     parts.push(t('status.purge.detailFailed', { count: failed }));
   }
   return parts.join(', ');
+};
+
+/** #271: live deletions are handed to the package cache in batches of this size. */
+export const LIVE_DELETION_BATCH = 25;
+
+/**
+ * #272: how many failed PATCH/DELETE results in a row pause the run.
+ * A 2.1.3 Firefox run stripped nothing for four hours because every
+ * request failed and nothing stopped it.
+ */
+export const FAILURE_STREAK_PAUSE_AT = 25;
+
+/**
+ * Pauses the run (the user resumes from the floating pause control) once
+ * `streak` reaches FAILURE_STREAK_PAUSE_AT, logging a warning first. The
+ * message loop already blocks in `waitWhilePaused` on its next iteration,
+ * so this only flips the flag and returns. Fires once per streak: the
+ * caller resets the streak on any success, and this checks equality
+ * rather than "at least", so a run the user resumes into further
+ * failures pauses again only after another full streak.
+ */
+const pauseOnFailureStreak = async (
+  streak: number,
+  dispatch: (action: any) => void,
+  getState: () => RootState,
+): Promise<void> => {
+  if (streak % FAILURE_STREAK_PAUSE_AT !== 0) return;
+  dispatch(addStatusEntry({
+    level: 'warning',
+    message: t('status.purge.failureStreakPaused', { count: FAILURE_STREAK_PAUSE_AT }),
+  }));
+  dispatch(setDiscrubPaused(true));
+  await waitWhilePaused(getState);
 };
 
 /**
@@ -683,6 +716,14 @@ async function purgeChannelMessages(
   let totalSkippedArchivedOptOut = 0;
   let totalSkippedPinned = 0;
   let totalSkippedPreserved = 0;
+  // #272: attachments-only skips of messages with no uploaded file. Kept
+  // apart from `totalSkipped` (shared by six skip reasons) so the summary
+  // can say why nothing was touched.
+  let totalSkippedNoAttachment = 0;
+  // #272: consecutive failed PATCH/DELETE results in this channel. Reset
+  // by any success; at FAILURE_STREAK_PAUSE_AT the run pauses itself so
+  // a multi-hour run of guaranteed failures cannot burn through.
+  let failureStreak = 0;
   let totalProcessed = 0;
   let lastProgressDispatch = 0;
   let searchPageCount = 0;
@@ -1090,6 +1131,7 @@ async function purgeChannelMessages(
             // deleteMessage here, which destroyed text-only messages
             // silently.
             totalSkipped++;
+            totalSkippedNoAttachment++;
           } else if (currentUserId && message.author?.id !== currentUserId) {
             // Discord's PATCH (edit) endpoint only accepts edits from the
             // message author, even for accounts with MANAGE_MESSAGES.
@@ -1105,12 +1147,15 @@ async function purgeChannelMessages(
             const response = await discordService.deleteMessage(token, message.id, targetChannelId);
             if (response.success) {
               totalDeleted++;
+              failureStreak = 0;
+              noteLiveDeletion(targetChannelId, message.id);
             } else {
               totalFailed++;
               dispatch(addStatusEntry({
                 level: 'warning',
                 message: t('status.purge.deleteAttachmentOnlyFailed', { reason: t('status.purge.httpStatus', { status: response.status ?? '?' }), id: message.id }),
               }));
+              await pauseOnFailureStreak(++failureStreak, dispatch, getState);
             }
           } else {
             const response = await discordService.editMessage(
@@ -1120,6 +1165,7 @@ async function purgeChannelMessages(
             );
             if (response.success) {
               totalEditedAttachmentsOnly++;
+              failureStreak = 0;
             } else {
               // Don't count as "stripped". Log once per miss so the user
               // can audit; keep Discord's status for diagnostics.
@@ -1128,6 +1174,7 @@ async function purgeChannelMessages(
                 level: 'warning',
                 message: t('status.purge.stripFailed', { reason: t('status.purge.httpStatus', { status: response.status ?? '?' }), id: message.id }),
               }));
+              await pauseOnFailureStreak(++failureStreak, dispatch, getState);
             }
           }
         } else if (retainAttachedMedia && hasAttachments) {
@@ -1144,12 +1191,14 @@ async function purgeChannelMessages(
             );
             if (response.success) {
               totalSkipped++;
+              failureStreak = 0;
             } else {
               totalFailed++;
               dispatch(addStatusEntry({
                 level: 'warning',
                 message: t('status.purge.clearTextFailed', { reason: t('status.purge.httpStatus', { status: response.status ?? '?' }), id: message.id }),
               }));
+              await pauseOnFailureStreak(++failureStreak, dispatch, getState);
             }
           }
         } else if (message.author?.id !== userId) {
@@ -1167,6 +1216,8 @@ async function purgeChannelMessages(
           const response = await discordService.deleteMessage(token, message.id, targetChannelId);
           if (response.success) {
             totalDeleted++;
+            failureStreak = 0;
+            noteLiveDeletion(targetChannelId, message.id);
             if (finalPassIds.has(message.id)) totalFinalPass++;
           } else {
             totalFailed++;
@@ -1174,6 +1225,7 @@ async function purgeChannelMessages(
               level: 'warning',
               message: t('status.purge.deleteFailed', { reason: t('status.purge.httpStatus', { status: response.status ?? '?' }), id: message.id }),
             }));
+            await pauseOnFailureStreak(++failureStreak, dispatch, getState);
           }
         }
 
@@ -1221,6 +1273,16 @@ async function purgeChannelMessages(
     dispatch(addStatusEntry({
       level: 'info',
       message: t('status.purge.skippedOtherAuthors', { count: totalSkippedNotAuthor }),
+    }));
+  }
+
+  // #272: attachments-only left messages alone because they carried no
+  // uploaded file. One line per channel, so a run that "did nothing"
+  // says why.
+  if (deleteAttachmentsOnly && totalSkippedNoAttachment > 0) {
+    dispatch(addStatusEntry({
+      level: 'info',
+      message: t('status.purge.attachmentsOnlySkipped', { count: totalSkippedNoAttachment }),
     }));
   }
 

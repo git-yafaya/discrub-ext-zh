@@ -1932,6 +1932,147 @@ describe('Bulk Purge Operations', () => {
       cy.get('@deleteMessage.all').should('have.length', 0);
     });
 
+    it('shows stripped and failed counts on the running label and in the summary (#272)', () => {
+      const searchResult = {
+        messages: [
+          [makeMessage('780000000000000050', 'Strips fine', true)],
+          [makeMessage('780000000000000051', 'Refused by Discord', true)],
+        ],
+        total_results: 2,
+        threads: [],
+      };
+
+      let searchCount = 0;
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, (req) => {
+        searchCount++;
+        if (searchCount === 1) {
+          req.reply({ statusCode: 200, body: searchResult });
+        } else {
+          // Hold the run open on the empty follow-up page so the live
+          // label can be read while both counts are in.
+          req.reply({ statusCode: 200, body: { messages: [], total_results: 0, threads: [] }, delay: 3000 });
+        }
+      }).as('searchMessages');
+
+      let patchCount = 0;
+      cy.intercept('PATCH', `${API}/channels/*/messages/*`, (req) => {
+        patchCount++;
+        req.reply(patchCount === 1 ? { statusCode: 200, body: {} } : { statusCode: 403, body: { message: 'Missing Permissions', code: 50013 } });
+      }).as('editMessage');
+
+      selectChannelsForPurge('general');
+      openPurgeDialog();
+      cy.get('[role="dialog"]').find('button[value="attachmentsOnly"]').click();
+      addUserById('111222333444555666');
+      cy.wait('@lookupUser');
+      confirmPurge();
+      cy.get('[role="dialog"]').should('not.exist');
+
+      cy.contains(/2 processed \(0 deleted, 1 stripped, 1 failed\)/, { timeout: 15000 }).should('exist');
+
+      waitForPurgeComplete();
+      cy.get('@editMessage.all').should('have.length', 2);
+      verifyStatusEntry(/Purge: Completed .*1 stripped of attachments, 1 failed/);
+    });
+
+    it('says how many messages had no uploaded file when nothing gets stripped (#272)', () => {
+      // has: image also matches embeds, which carry no attachment to
+      // strip. The run must not PATCH them and must say why it did nothing.
+      const embedOnly = (id: string) => ({
+        ...makeMessage(id, 'https://example.com/picture', false),
+        embeds: [{ type: 'image', url: 'https://example.com/picture', thumbnail: { url: 'https://example.com/picture.png' } }],
+      });
+      const searchResult = {
+        messages: [[embedOnly('780000000000000060')], [embedOnly('780000000000000061')]],
+        total_results: 2,
+        threads: [],
+      };
+
+      let searchCount = 0;
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, (req) => {
+        searchCount++;
+        req.reply({
+          statusCode: 200,
+          body: searchCount === 1 ? searchResult : { messages: [], total_results: 0, threads: [] },
+        });
+      }).as('searchMessages');
+      cy.intercept('PATCH', `${API}/channels/*/messages/*`, { statusCode: 200, body: {} }).as('editMessage');
+      cy.intercept('DELETE', `${API}/channels/*/messages/*`, { statusCode: 204, body: {} }).as('deleteMessage');
+
+      selectChannelsForPurge('general');
+      openPurgeDialog();
+      cy.get('[role="dialog"]').find('button[value="attachmentsOnly"]').click();
+      addUserById('111222333444555666');
+      cy.wait('@lookupUser');
+      confirmPurge();
+      cy.get('[role="dialog"]').should('not.exist');
+
+      waitForPurgeComplete();
+      cy.get('@editMessage.all').should('have.length', 0);
+      cy.get('@deleteMessage.all').should('have.length', 0);
+      verifyStatusEntry(/2 messages had no uploaded file/);
+      verifyStatusEntry(/Purge: Completed .*0 deleted, 2 skipped/);
+    });
+
+    it('pauses itself after 25 refused requests in a row and carries on after Resume (#272)', () => {
+      const searchResult = {
+        messages: Array.from({ length: 30 }, (_, i) => [
+          makeMessage(`780000000000000${String(100 + i).padStart(3, '0')}`, `Refused ${i}`, true),
+        ]),
+        total_results: 30,
+        threads: [],
+      };
+
+      let searchCount = 0;
+      cy.intercept('GET', `${API}/guilds/*/messages/search*`, (req) => {
+        searchCount++;
+        req.reply({
+          statusCode: 200,
+          body: searchCount === 1 ? searchResult : { messages: [], total_results: 0, threads: [] },
+        });
+      }).as('searchMessages');
+      cy.intercept('PATCH', `${API}/channels/*/messages/*`, {
+        statusCode: 403,
+        body: { message: 'Missing Permissions', code: 50013 },
+      }).as('editMessage');
+
+      // 30 messages at the default 2 s delete delay would outlast the
+      // spec; the pause is about counts, not pacing.
+      cy.window().then((win) => {
+        const store = (win as any).__store__;
+        store.dispatch({
+          type: 'app/setSettings',
+          payload: { ...store.getState().app.settings, searchDelay2: '0', deleteDelay2: '0' },
+        });
+      });
+
+      selectChannelsForPurge('general');
+      openPurgeDialog();
+      cy.get('[role="dialog"]').find('button[value="attachmentsOnly"]').click();
+      addUserById('111222333444555666');
+      cy.wait('@lookupUser');
+      confirmPurge();
+      cy.get('[role="dialog"]').should('not.exist');
+
+      cy.window({ timeout: 30000 }).should((win) => {
+        expect((win as any).__store__.getState().app.discrubPaused).to.eq(true);
+      });
+      cy.get('@editMessage.all').should('have.length', 25);
+      verifyStatusEntry(/Paused after 25 requests in a row failed/);
+      cy.contains(/Paused/).should('exist');
+
+      cy.get('[aria-label="Resume"]').first().click({ force: true });
+
+      waitForPurgeComplete();
+      cy.get('@editMessage.all').should('have.length', 30);
+      verifyStatusEntry(/Purge: Completed .*30 failed/);
+      cy.window().then((win) => {
+        const entries = (win as any).__store__.getState().status.entries as { message: string }[];
+        const pauses = entries.filter((e) => /Paused after 25 requests/.test(e.message));
+        expect(pauses, 'one pause for 30 failures').to.have.length(1);
+      });
+    });
+
     it('routes PATCH to message.channel_id when messages live inside threads', () => {
       // Message reports channel_id as a thread ID, distinct from the
       // top-level channel we're purging. Discord 404s the PATCH if we

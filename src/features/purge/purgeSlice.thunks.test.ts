@@ -6689,4 +6689,294 @@ describe('purgeSlice thunks', () => {
       expect(purgeGuilds.fulfilled.match(result)).toBe(true);
     });
   });
+
+
+  // ── #272: attachments-only visibility and the failure streak pause ──────
+
+  describe('bulkPurgeChannels — attachments-only visibility (#272)', () => {
+    const attachment = { id: 'att1', filename: 'photo.png', url: 'https://cdn.example.com/photo.png' };
+
+    it('carries stripped and failed counts in the progress payload and completed stats', async () => {
+      const stripped = mockMessage('m1', 0, [attachment]);
+      const failing = mockMessage('m2', 0, [attachment]);
+      setupSearchResults([[stripped, failing]]);
+      mockEditMessage
+        .mockResolvedValueOnce({ success: true, status: 200 })
+        .mockResolvedValueOnce({ success: false, status: 403 });
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+
+      const progress = selectPurgeProgress(store.getState());
+      expect(progress).not.toBeNull();
+      expect(progress!.processed).toBe(2);
+      expect(progress!.deleted).toBe(0);
+      expect(progress!.editedAttachmentsOnly).toBe(1);
+      expect(progress!.failed).toBe(1);
+    });
+
+    it('rolls stripped and failed counts into completedStats for the next channel', async () => {
+      const stripped = mockMessage('m1', 0, [attachment]);
+      const failing = mockMessage('m2', 0, [attachment]);
+      // Channel 1 gets the page, channel 2 gets nothing.
+      setupSearchResults([[stripped, failing]]);
+      mockEditMessage
+        .mockResolvedValueOnce({ success: true, status: 200 })
+        .mockResolvedValueOnce({ success: false, status: 403 });
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general'), mockChannel('ch2', 'random')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+
+      const progress = selectPurgeProgress(store.getState());
+      expect(progress?.bulk?.currentChannelName).toBe('random');
+      expect(progress?.bulk?.completedStats.editedAttachmentsOnly).toBe(1);
+      expect(progress?.bulk?.completedStats.failed).toBe(1);
+    });
+
+    it('logs one line saying how many messages had no uploaded file', async () => {
+      const plain1 = mockMessage('m1');
+      const plain2 = mockMessage('m2');
+      const withFile = mockMessage('m3', 0, [attachment]);
+      setupSearchResults([[plain1, plain2, withFile]]);
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+
+      const entries = store.getState().status.entries;
+      const line = entries.filter((e) => e.message.includes('had no uploaded file'));
+      expect(line).toHaveLength(1);
+      expect(line[0].level).toBe('info');
+      expect(line[0].message).toContain('2 messages had no uploaded file');
+    });
+
+    it('does not count other-author skips as no-attachment skips', async () => {
+      const other = { id: '999', username: 'other' } as User;
+      const theirs = mockMessage('m1', 0, [attachment], other);
+      setupSearchResults([[theirs]]);
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+
+      const entries = store.getState().status.entries;
+      expect(entries.some((e) => e.message.includes('had no uploaded file'))).toBe(false);
+      expect(entries.some((e) => e.message.includes('authored by other users'))).toBe(true);
+    });
+
+    it('stays quiet about no-attachment skips on a normal delete run', async () => {
+      setupSearchResults([[mockMessage('m1'), mockMessage('m2')]]);
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id]),
+          guildId: 'guild1',
+        }),
+      );
+
+      const entries = store.getState().status.entries;
+      expect(entries.some((e) => e.message.includes('had no uploaded file'))).toBe(false);
+    });
+
+    it('pauses the run after 25 failed requests in a row and logs a warning', async () => {
+      const messages = Array.from({ length: 30 }, (_, i) => mockMessage(`m${i}`, 0, [attachment]));
+      setupSearchResults([messages]);
+      mockEditMessage.mockResolvedValue({ success: false, status: 403 });
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+
+      expect(store.getState().app.discrubPaused).toBe(true);
+      const entries = store.getState().status.entries;
+      const warnings = entries.filter((e) => e.level === 'warning' && e.message.includes('Paused after 25 requests in a row failed'));
+      // 30 failures cross the threshold once; the next pause would need 50.
+      expect(warnings).toHaveLength(1);
+      // The pause flag was set before the 26th message was tried.
+      expect(waitWhilePaused).toHaveBeenCalled();
+      // Every message was still tried (the pause helper is mocked to resolve at once).
+      expect(mockEditMessage).toHaveBeenCalledTimes(30);
+    });
+
+    it('resets the streak on a success so scattered failures never pause', async () => {
+      const messages = Array.from({ length: 40 }, (_, i) => mockMessage(`m${i}`, 0, [attachment]));
+      setupSearchResults([messages]);
+      let n = 0;
+      mockEditMessage.mockImplementation(() => {
+        n++;
+        return Promise.resolve(n % 20 === 0 ? { success: true, status: 200 } : { success: false, status: 403 });
+      });
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+
+      expect(store.getState().app.discrubPaused).toBe(false);
+      const entries = store.getState().status.entries;
+      expect(entries.some((e) => e.message.includes('Paused after'))).toBe(false);
+    });
+
+    it('applies the failure streak pause to plain delete runs as well', async () => {
+      const messages = Array.from({ length: 25 }, (_, i) => mockMessage(`m${i}`));
+      setupSearchResults([messages]);
+      mockDeleteMessage.mockResolvedValue({ success: false, status: 403 });
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id]),
+          guildId: 'guild1',
+        }),
+      );
+
+      expect(store.getState().app.discrubPaused).toBe(true);
+    });
+  });
+
+
+  // ── #271: live deletions feed the package deleted cache ─────────────────
+
+  describe('bulkPurgeChannels — feeds the package deleted cache (#271)', () => {
+    const PACKAGE_USER = CURRENT_USER.id;
+    const loadPackageWith = (channelIds: string[]) => {
+      store.dispatch({
+        type: 'package/import/fulfilled',
+        payload: {
+          parsed: {
+            user: { id: PACKAGE_USER, username: 'testuser', globalName: null, avatarHash: null },
+            guilds: [],
+            channels: channelIds.map((id) => ({ id, type: 0, name: id, guildId: 'guild1', guildName: 'g', messageCount: 5, isOrphan: false })),
+            totalMessages: 5 * channelIds.length,
+            packageSizeBytes: 1,
+          },
+          validation: { ok: true, readOnly: false, warnings: [], errors: [] },
+          deletedMessageIds: {},
+          goneMessageIds: {},
+        },
+      });
+    };
+
+    beforeEach(async () => {
+      await storage.package.clear();
+    });
+
+    it('records deletions in a channel the package holds, in state and in storage', async () => {
+      loadPackageWith(['ch1']);
+      store.dispatch({ type: 'package/toggleMessageSelection', payload: { channelId: 'ch1', messageId: 'm1' } });
+      setupSearchResults([[mockMessage('m1'), mockMessage('m2')]]);
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id]),
+          guildId: 'guild1',
+        }),
+      );
+      // The cache write is fire-and-forget from the purge loop.
+      await new Promise((r) => setTimeout(r, 0));
+
+      const pkg = store.getState().package;
+      expect(pkg.deletedMessageIds['ch1']).toEqual(['m1', 'm2']);
+      expect(pkg.goneMessageIds['ch1']).toBeUndefined();
+      expect(pkg.selectedMessageIds['ch1']).toBeUndefined();
+      expect(await storage.package.get(`deleted:${PACKAGE_USER}`)).toEqual({ ch1: ['m1', 'm2'] });
+    });
+
+    it('records attachments-only deletions too', async () => {
+      loadPackageWith(['ch1']);
+      const fileOnly = { ...mockMessage('m1', 0, [{ id: 'a', filename: 'f.png', url: 'u' }]), content: '' } as Message;
+      setupSearchResults([[fileOnly]]);
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id], false, true),
+          guildId: 'guild1',
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(store.getState().package.deletedMessageIds['ch1']).toEqual(['m1']);
+    });
+
+    it('ignores channels the package does not hold, and no package at all', async () => {
+      loadPackageWith(['other']);
+      setupSearchResults([[mockMessage('m1')]]);
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id]),
+          guildId: 'guild1',
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 0));
+      expect(store.getState().package.deletedMessageIds).toEqual({});
+      expect(await storage.package.get(`deleted:${PACKAGE_USER}`)).toBeFalsy();
+
+      store = createStore();
+      expect(store.getState().package).toEqual(initialPackageState);
+      setupSearchResults([[mockMessage('m1')]]);
+      const result = await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id]),
+          guildId: 'guild1',
+        }),
+      );
+      expect(bulkPurgeChannels.fulfilled.match(result)).toBe(true);
+      expect(store.getState().package.deletedMessageIds).toEqual({});
+    });
+
+    it('flushes in batches of 25 during the run, not only at the end', async () => {
+      loadPackageWith(['ch1']);
+      const messages = Array.from({ length: 30 }, (_, i) => mockMessage(`m${i}`));
+      setupSearchResults([messages]);
+      let seenAtCall26: string[] | undefined;
+      let n = 0;
+      mockDeleteMessage.mockImplementation(async () => {
+        n++;
+        if (n === 26) seenAtCall26 = store.getState().package.deletedMessageIds['ch1'];
+        return { success: true, status: 204 };
+      });
+
+      await store.dispatch(
+        bulkPurgeChannels({
+          channels: [mockChannel('ch1', 'general')],
+          config: messagesConfig([CURRENT_USER.id]),
+          guildId: 'guild1',
+        }),
+      );
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(seenAtCall26).toHaveLength(25);
+      expect(store.getState().package.deletedMessageIds['ch1']).toHaveLength(30);
+    });
+  });
 });

@@ -24,6 +24,13 @@ describe('FilterModal', () => {
       expect(screen.getByText('Filters')).toBeInTheDocument();
     });
 
+    it('explains that has: types are matched together (#272)', () => {
+      renderWithProviders(<FilterModal {...defaultProps} />);
+      const help = screen.getAllByTestId('has-filter-help');
+      expect(help.length).toBeGreaterThan(0);
+      expect(help[0]).toHaveTextContent('Discord matches messages that have every selected type.');
+    });
+
     it('should not render content when closed', () => {
       renderWithProviders(<FilterModal {...defaultProps} open={false} />);
       expect(screen.queryByText('Filters')).not.toBeInTheDocument();

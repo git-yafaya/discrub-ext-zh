@@ -23,6 +23,19 @@ const selectDmState = (state: RootState) => state.dm;
 const selectPackageState = (state: RootState) => state.package;
 const selectDevState = (state: RootState) => state.dev;
 
+/**
+ * The parenthetical on the running purge label. "deleted" is always
+ * shown; "stripped" and "failed" appear only when they are over zero, so
+ * a plain delete run renders exactly the label it always has, while an
+ * attachments-only run (#272) shows what it is actually doing.
+ */
+const purgeDetailParts = (deleted: number, stripped: number, failed: number): string => {
+  const parts = [t('operation.partDeleted', { count: deleted })];
+  if (stripped > 0) parts.push(t('operation.partStripped', { count: stripped }));
+  if (failed > 0) parts.push(t('operation.partFailed', { count: failed }));
+  return parts.join(', ');
+};
+
 export const selectOperationSummary = createSelector(
   [selectExportState, selectMessageState, selectAppState, selectPurgeState, selectChannelState, selectGuildState, selectDmState, selectPackageState, selectDevState],
   (exportState, messageState, appState, purgeState, channelState, guildState, dmState, packageState, devState): OperationSummary => {
@@ -72,22 +85,27 @@ export const selectOperationSummary = createSelector(
           };
         }
 
-        const totalDeleted = completedStats.deleted + progress.deleted;
+        const detail = purgeDetailParts(
+          completedStats.deleted + progress.deleted,
+          (completedStats.editedAttachmentsOnly ?? 0) + (progress.editedAttachmentsOnly ?? 0),
+          (completedStats.failed ?? 0) + (progress.failed ?? 0),
+        );
         return {
           isRunning: true, isPaused, tier: 'heavy',
           label: isPaused
             ? t('operation.paused', { label: channelLabel })
-            : t('operation.purgingBulk', { label: channelLabel, processed: progress.processed, deleted: totalDeleted }),
+            : t('operation.purgingBulk', { label: channelLabel, processed: progress.processed, detail }),
           progress: pct,
         };
       }
 
       if (progress) {
+        const detail = purgeDetailParts(progress.deleted, progress.editedAttachmentsOnly ?? 0, progress.failed ?? 0);
         return {
           isRunning: true, isPaused, tier: 'heavy',
           label: isPaused
-            ? 'Paused · Purging'
-            : `Purging... ${progress.processed} processed (${progress.deleted} deleted)`,
+            ? t('operation.pausedPurging')
+            : t('operation.purgingProgress', { processed: progress.processed, detail }),
         };
       }
       return { isRunning: true, isPaused, tier: 'heavy', label: isPaused ? t('operation.pausedPurging') : t('operation.purging') };

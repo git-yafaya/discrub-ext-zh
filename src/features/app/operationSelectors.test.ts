@@ -983,4 +983,68 @@ describe('operationSelectors', () => {
       expect(summary.label).toMatch(/Paused/);
     });
   });
+
+
+  describe('purge label parts (#272)', () => {
+    const bulkProgress = (overrides: Partial<PurgeProgress>, completed: Partial<NonNullable<PurgeProgress['bulk']>['completedStats']> = {}): PurgeProgress => ({
+      processed: 25,
+      deleted: 10,
+      skipped: 15,
+      reactionsRemoved: 0,
+      ...overrides,
+      bulk: {
+        currentIndex: 0,
+        totalChannels: 1,
+        currentChannelName: 'general',
+        completedStats: { deleted: 0, skipped: 0, reactionsRemoved: 0, ...completed },
+      },
+    });
+    const withProgress = (progress: PurgeProgress) =>
+      createBaseState({ purge: { ...createBaseState().purge, isPurging: true, purgeProgress: progress } });
+
+    it('shows deleted plus stripped when attachments were stripped', () => {
+      const summary = selectOperationSummary(withProgress(bulkProgress({ editedAttachmentsOnly: 4 })));
+      expect(summary.label).toBe('Purging... Channel 1/1: general · 25 processed (10 deleted, 4 stripped)');
+    });
+
+    it('shows all three parts when something also failed', () => {
+      const summary = selectOperationSummary(withProgress(bulkProgress({ editedAttachmentsOnly: 4, failed: 2 })));
+      expect(summary.label).toBe('Purging... Channel 1/1: general · 25 processed (10 deleted, 4 stripped, 2 failed)');
+    });
+
+    it('shows failed without stripped on a plain delete run that hit an error', () => {
+      const summary = selectOperationSummary(withProgress(bulkProgress({ failed: 1 })));
+      expect(summary.label).toBe('Purging... Channel 1/1: general · 25 processed (10 deleted, 1 failed)');
+    });
+
+    it('adds the counts from channels already completed', () => {
+      const summary = selectOperationSummary(withProgress(bulkProgress({ editedAttachmentsOnly: 1, failed: 1 }, { deleted: 5, editedAttachmentsOnly: 9, failed: 3 })));
+      expect(summary.label).toBe('Purging... Channel 1/1: general · 25 processed (15 deleted, 10 stripped, 4 failed)');
+    });
+
+    it('treats missing counters as zero and keeps the plain label', () => {
+      const summary = selectOperationSummary(withProgress(bulkProgress({ editedAttachmentsOnly: undefined, failed: undefined })));
+      expect(summary.label).toBe('Purging... Channel 1/1: general · 25 processed (10 deleted)');
+    });
+
+    it('still prefers the reactions label when reactions were removed', () => {
+      const summary = selectOperationSummary(withProgress(bulkProgress({ reactionsRemoved: 3, editedAttachmentsOnly: 4, failed: 2 })));
+      expect(summary.label).toBe('Removing reactions... Channel 1/1: general · 25 scanned (3 removed)');
+    });
+
+    it('renders the parts on the non-bulk label too', () => {
+      const progress: PurgeProgress = { processed: 7, deleted: 2, skipped: 1, reactionsRemoved: 0, editedAttachmentsOnly: 3, failed: 1 };
+      const summary = selectOperationSummary(withProgress(progress));
+      expect(summary.label).toBe('Purging... 7 processed (2 deleted, 3 stripped, 1 failed)');
+    });
+
+    it('uses the translated paused label on the non-bulk branch', () => {
+      const progress: PurgeProgress = { processed: 7, deleted: 2, skipped: 1, reactionsRemoved: 0 };
+      const state = createBaseState({
+        purge: { ...createBaseState().purge, isPurging: true, purgeProgress: progress },
+        app: { ...createBaseState().app, discrubPaused: true },
+      });
+      expect(selectOperationSummary(state).label).toBe('Paused · Purging');
+    });
+  });
 });
