@@ -6,6 +6,64 @@
 const COUNTDOWN_SECONDS = 5;
 const PREF_KEY = 'discrub-launcher-preference';
 
+
+const LAUNCHER_COPY = {
+  en: {
+    title: 'Discrub Launcher',
+    subtitle: 'Discord Data Management',
+    selectVersion: 'Select version',
+    versionPrompt: 'Modern or Classic?',
+    launch: 'Launch Discrub',
+    launching: 'Launching...',
+    launchingIn: (seconds) => 'Launching in ' + seconds + '...',
+    loading: 'Loading...',
+    switchHint: 'Click the dropdown to switch versions',
+    selectHint: 'Select a version to get started',
+    classicSuffix: ' (Classic)',
+  },
+  'zh-CN': {
+    title: 'Discrub 启动器',
+    subtitle: 'Discord 数据管理',
+    selectVersion: '选择版本',
+    versionPrompt: '新版还是经典版？',
+    launch: '启动 Discrub',
+    launching: '正在启动…',
+    launchingIn: (seconds) => seconds + ' 秒后启动…',
+    loading: '正在加载…',
+    switchHint: '点击下拉菜单可切换版本',
+    selectHint: '请选择一个版本以开始使用',
+    classicSuffix: '（经典版）',
+  },
+};
+
+function detectLauncherLanguage() {
+  const candidates = navigator.languages?.length
+    ? navigator.languages
+    : navigator.language
+      ? [navigator.language]
+      : [];
+
+  for (const candidate of candidates) {
+    const normalized = candidate.trim().toLowerCase().replace(/_/g, '-');
+    if (
+      normalized === 'zh' ||
+      normalized === 'zh-hans' ||
+      normalized.startsWith('zh-hans-') ||
+      normalized === 'zh-cn' ||
+      normalized.startsWith('zh-cn-') ||
+      normalized === 'zh-sg' ||
+      normalized.startsWith('zh-sg-')
+    ) {
+      return 'zh-CN';
+    }
+  }
+
+  return 'en';
+}
+
+const launcherLanguage = detectLauncherLanguage();
+const copy = LAUNCHER_COPY[launcherLanguage];
+
 // DOM elements
 const logo = document.getElementById('logo');
 const versionSelect = document.getElementById('version-select');
@@ -15,6 +73,28 @@ const progressBar = document.getElementById('progress-bar');
 const progressFill = document.getElementById('progress-fill');
 const countdownText = document.getElementById('countdown-text');
 const hintText = document.getElementById('hint-text');
+
+
+function applyLauncherLanguage() {
+  document.documentElement.lang = launcherLanguage;
+  document.title = copy.title;
+
+  const subtitle = document.querySelector('.subtitle');
+  const selectorLabel = document.querySelector('.selector-label');
+  const promptOption = versionSelect.querySelector('option[value=""]');
+  const classicOption = versionSelect.querySelector('option[value="classic"]');
+
+  if (subtitle) subtitle.textContent = copy.subtitle;
+  if (selectorLabel) selectorLabel.textContent = copy.selectVersion;
+  if (promptOption) promptOption.textContent = copy.versionPrompt;
+  if (classicOption) {
+    classicOption.textContent = classicOption.textContent.replace(
+      /\s*\(Classic\)$/,
+      copy.classicSuffix,
+    );
+  }
+  launchText.textContent = copy.launch;
+}
 
 // State
 let countdown = COUNTDOWN_SECONDS;
@@ -52,7 +132,7 @@ function startCountdown() {
   countdownPaused = false;
   progressBar.classList.add('active');
   updateProgressBar(countdown);
-  countdownText.textContent = 'Launching in ' + countdown + '...';
+  countdownText.textContent = copy.launchingIn(countdown);
 
   clearInterval(countdownInterval);
   countdownInterval = setInterval(function () {
@@ -63,10 +143,10 @@ function startCountdown() {
 
     if (countdown <= 0) {
       clearInterval(countdownInterval);
-      countdownText.textContent = 'Launching...';
+      countdownText.textContent = copy.launching;
       launch();
     } else {
-      countdownText.textContent = 'Launching in ' + Math.ceil(countdown) + '...';
+      countdownText.textContent = copy.launchingIn(Math.ceil(countdown));
     }
   }, 100);
 }
@@ -88,7 +168,7 @@ function launch() {
   countdownText.textContent = '';
   progressBar.classList.remove('active');
   launchBtn.disabled = true;
-  launchText.textContent = 'Loading...';
+  launchText.textContent = copy.loading;
 
   // Save preference
   if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
@@ -130,7 +210,7 @@ function onVersionChange() {
   launchBtn.disabled = !selectedVersion;
 
   if (selectedVersion) {
-    launchText.textContent = 'Launch Discrub';
+    launchText.textContent = copy.launch;
     hintText.textContent = '';
 
     // Restart countdown if returning user changed selection
@@ -156,6 +236,7 @@ window.addEventListener('message', function (event) {
  * Initialize launcher
  */
 function init() {
+  applyLauncherLanguage();
   initLogo();
 
   loadPreference(function (savedVersion) {
@@ -164,11 +245,11 @@ function init() {
       selectedVersion = savedVersion;
       versionSelect.value = savedVersion;
       launchBtn.disabled = false;
-      hintText.textContent = 'Click the dropdown to switch versions';
+      hintText.textContent = copy.switchHint;
       startCountdown();
     } else {
       isFirstTime = true;
-      hintText.textContent = 'Select a version to get started';
+      hintText.textContent = copy.selectHint;
       launchBtn.disabled = true;
     }
   });

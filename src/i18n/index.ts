@@ -2,7 +2,7 @@
  * i18next bootstrap. Imported once from `main.tsx` (and the Vitest
  * setup) so `t()` works everywhere, including Redux thunks and
  * services that render no React. Catalogs are bundled: the extension
- * has no network path for lazy-loading them and the two files are small.
+ * has no network path for lazy-loading them and the files are small.
  *
  * English stays the default so the existing English-text assertions in
  * the unit and E2E suites keep describing the shipped product.
@@ -11,12 +11,14 @@ import i18next from 'i18next';
 import { initReactI18next } from 'react-i18next';
 import en from './locales/en.json';
 import de from './locales/de.json';
+import zhCN from './locales/zh-CN.json';
 import { DEFAULT_LANGUAGE, type LanguageCode } from './language';
 import { syncCoreMessages } from './coreMessages';
 
 export const resources = {
   en: { translation: en },
   de: { translation: de },
+  'zh-CN': { translation: zhCN },
 } as const;
 
 void i18next.use(initReactI18next).init({
